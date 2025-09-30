@@ -14,6 +14,7 @@ class Seq6 : public ComputerCard
 
         private:
             uint16_t count = 0;
+            uint16_t pre_count = 0;
             uint8_t pulse = 0;
             Seq6* parent;  // ← Reference to parent object
         public:
@@ -26,18 +27,28 @@ class Seq6 : public ComputerCard
 
             bool IsActive()
             {
-                return count;
+                return count != 0;
+            }
+
+            void Reset()
+            {
+                count = 0;
+                pre_count = 48;
+                parent->PulseOut(pulse, false);
             }
 
             void Tick()
             {
-                if(IsActive())
+                if(pre_count == 0 && IsActive())
                 {
                     count--;
                     parent->PulseOut(pulse, true);
                 }
                 else
                 {
+                    if(pre_count > 0)
+                        pre_count--;
+
                     parent->PulseOut(pulse, false);
                 }
             }
@@ -51,9 +62,10 @@ class Seq6 : public ComputerCard
         uint16_t step_len_samples = 36000;
         uint16_t step_len_c = 0;
         uint8_t current_stage = 0;
-        uint8_t current_step_c = 0;
-        uint16_t current_gate_cd = 0;
+        uint8_t next_step = 0;
         Switch last_switch_val = Switch::Up;
+        int16_t audioOut2Value = 0;
+        bool reset = true;
 
         /* uint32_t lcg_seed = static_cast<uint32_t>(UniqueCardID()); */
         /* uint32_t lcg_seed = static_cast<uint32_t>(time_us_64()); */
@@ -130,7 +142,10 @@ class Seq6 : public ComputerCard
         virtual void ProcessSample() override
         {
 
-            /* AudioOut1(getRandom() - 2048); */
+            // noise and s&h
+            AudioOut1(rnd12() - 2048);
+            AudioOut2(audioOut2Value);
+
             for(int i = 0; i < 6; i++)
                 LedOn(i, false);
 
@@ -140,36 +155,60 @@ class Seq6 : public ComputerCard
             {
                 case Switch::Up:
                 {
-                    Stage stage = stages[current_stage];
+                    // handle reset
+                    if(PulseIn2RisingEdge())
+                    {
+                        reset = true;
+                    }
 
+                    Stage stage = stages[current_stage];
                     // always set the note value
                     CVOutMIDINote(0, stage.note);
                     CVOutMIDINote(1, stage.note);
-                    //TODO gate counters etc
+
                     gate1.Tick();
+
                     if(gate1.IsActive())
                         LedOn(current_stage, true);
 
-                    //adjust step_len_samples based on incoming pulses
-                    if(PulseIn1RisingEdge())
-                        step_len_samples = step_len_c;
-
-                    if ((Connected(Input::Pulse1) && PulseIn1RisingEdge()) ||
-                            (!Connected(Input::Pulse1) &&
-                             step_len_c >= step_len_samples))
+                    if (PulseIn1RisingEdge())
+                            /* (!Connected(Input::Pulse1) && */
+                            /*  step_len_c >= step_len_samples)) */
                     {
+                        //adjust step_len_samples based on incoming pulses
+                        if(reset)
+                        {
+                            current_stage = 0;
+                            next_step = 0;
+                            gate1.Reset();
+                            auto gate_len =
+                                (stages[current_stage].steps * step_len_samples) >> 1;
+                            gate1.Activate(gate_len);
+                            audioOut2Value = rnd12() - 2048;
+                        }
+                        else
+                            step_len_samples = step_len_c;
                         //new step
-                        if(++current_step_c == stage.steps)
+                        if(next_step >= stage.steps)
                         {
                             //enough steps, increment stage
-                            current_step_c = 0;
+                            next_step = 0;
                             current_stage++;
                             if(current_stage == 6)
                                 current_stage = 0;
                             // 50% step length
-                            auto gate_len = (stages[current_stage].steps * step_len_samples) >> 1;
+                            auto gate_len =
+                                (stages[current_stage].steps * step_len_samples) >> 1;
                             gate1.Activate(gate_len);
+                            // s&h
+                            audioOut2Value = rnd12() - 2048;
                         }
+                        else
+                        {
+                            next_step++;
+                        }
+
+                        reset = false;
                         step_len_c = 0;
                     }
                     else
