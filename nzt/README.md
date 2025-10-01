@@ -9,7 +9,7 @@ inside the Elektron Digitone II.
 * **Main**: controls the "density" of the noise
 * **X**: Controls the noise seed when **Pulse In 1** is connected and **CV In 2** isn't. (see GateIn 1)
 * **Y**: Controls the gain applied to the value of **CV In 1** (if connected) that is added to the
-value of the main knob.
+value of the main knob. Up to 3x gain is applied.
 * **Audio Out 1**: the grain noise output
 * **Audio Out 2**: the "opposite" grain noise output, if **Audio Out 1** is dense this is sparse and so on.
 * **CV In 1**: CV in for modulating the noise density.
@@ -75,11 +75,11 @@ sound.
 This uses the noise oscillator and we need a CV/Gate source for this. Like a
 keyboard.
 
-Audio Out 1 -> Mixer 3
-CV Source -> Osc 2 pitch
-Osc 2 square -> Pulse In 1
-Gate Source -> Slope 1 In
-Slope 1 Out -> CV In 1
+* Audio Out 1 -> Mixer 3
+* CV Source -> Osc 2 pitch
+* Osc 2 square -> Pulse In 1
+* Gate Source -> Slope 1 In
+* Slope 1 Out -> CV In 1
 
 Set Slope 1 to decay mode with a slow time. Set Main knob fully CCW and Y to
 ~66%. Play your CV/Gate source, enjoy the nasal tones turning into increasingly
