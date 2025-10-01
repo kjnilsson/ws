@@ -8,54 +8,28 @@ class NoiseTools : public ComputerCard
 {
     private:
 
-        uint16_t gate_out_1_c = 0;
-        uint32_t rnd12_seed = 1;
-        int16_t s_and_h_value = 0;
-        uint16_t rnd12() noexcept
+        uint16_t gateOut1Count = 0;
+        uint32_t rnd12Seed = 1;
+        int16_t sampleHoldValue = 0;
+        uint16_t Rnd12() noexcept
         {
-            rnd12_seed = 1664525 * rnd12_seed + 1013904223;
-            return rnd12_seed >> 20;
+            rnd12Seed = 1664525 * rnd12Seed + 1013904223;
+            return rnd12Seed >> 20;
         }
 
-        uint16_t rnd() noexcept
+        uint16_t Rnd() noexcept
         {
-            static uint32_t lcg_seed = 1;
-            lcg_seed = 1664525 * lcg_seed + 1013904223;
-            return lcg_seed >> 16;
+            static uint32_t lcgSeed = 1;
+            lcgSeed = 1664525 * lcgSeed + 1013904223;
+            return lcgSeed >> 16;
         }
-        /* inline int16_t lerp12(int16_t a, int16_t b, uint8_t fract) */
-        /* { */
-        /*     return a + (((b - a) * fract) >> 8); */
-        /* } */
-        /* inline uint16_t log_scale(uint16_t input) noexcept */
-        /* { */
-        /*     if (input == 0) return 0; */
 
-        /*     // Lookup table for 12-bit to 16-bit logarithmic mapping */
-        /*     static constexpr uint16_t log_points[17] = { */
-        /*         0, 64, 128, 256, 512, 768, 1024, 1536, */
-        /*         2048, 3072, 4608, 6912, 13824, 27648, 41472, 55296, 65535 */
-        /*     }; */
-
-        /*     // Map input to table index */
-        /*     uint16_t index = input >> 8;  // Use upper 8 bits */
-        /*     uint16_t fraction = input & 0xFF;  // Lower 8 bits for interpolation */
-
-        /*     if (index >= 16) return 65535; */
-
-        /*     // Linear interpolation between table points */
-        /*     uint32_t base = log_points[index]; */
-        /*     uint32_t next = log_points[index + 1]; */
-
-        /*     return base + (((next - base) * fraction) >> 8); */
-        /* } */
-
-        inline uint16_t log_scale_high(uint16_t input) noexcept
+        inline uint16_t LogScale(uint16_t input) noexcept
         {
             if (input == 0) return 0;
 
             // 65 points - subdivides each original segment into 4 parts
-            static constexpr uint16_t log_points[65] = {
+            static constexpr uint16_t LOG_POINTS[65] = {
                 0, 16, 32, 48, 64, 80, 96, 112,
                 128, 160, 192, 224, 256, 320, 384, 448,
                 512, 576, 640, 704, 768, 832, 896, 960,
@@ -70,12 +44,12 @@ class NoiseTools : public ComputerCard
             uint16_t fraction = input & 0x3F;  // Lower 6 bits for interpolation
             if (index >= 64) return 65535;
 
-            uint32_t base = log_points[index];
-            uint32_t next = log_points[index + 1];
+            uint32_t base = LOG_POINTS[index];
+            uint32_t next = LOG_POINTS[index + 1];
             return base + (((next - base) * fraction) >> 6);
         }
 
-        inline int16_t clamp12bit(int32_t value) const {
+        inline int16_t Clamp12Bit(int32_t value) const {
             if(value < BIT_12_MIN)
                 return  BIT_12_MIN;
             if(value > BIT_12_MAX)
@@ -83,13 +57,13 @@ class NoiseTools : public ComputerCard
             return static_cast<int16_t>(value);
         }
 
-        int16_t ring_mod(int16_t carrier, int16_t modulator)
+        int16_t RingMod(int16_t carrier, int16_t modulator)
         {
             int32_t x = static_cast<int32_t>(carrier) * static_cast<int32_t>(modulator);
-            return clamp12bit(x >> 11);
+            return Clamp12Bit(x >> 11);
         }
 
-        inline int16_t applyGainFast(int16_t signal, uint16_t gain) {
+        inline int16_t apply_gain(int16_t signal, uint16_t gain) {
             // Multiply
             int32_t result = static_cast<int32_t>(signal) *
                 static_cast<int32_t>(gain * 3);
@@ -116,7 +90,7 @@ class NoiseTools : public ComputerCard
                     knobXVal = KnobVal(Knob::X);
 
                 // reset the seed
-                rnd12_seed = knobXVal >> 5;
+                rnd12Seed = knobXVal >> 5;
             }
 
             uint16_t main = KnobVal(Knob::Main);
@@ -124,36 +98,40 @@ class NoiseTools : public ComputerCard
             if(Connected(Input::CV1))
             {
                 // apply cv and cv gain
-                int32_t after_gain = main + applyGainFast(CVIn1(), KnobVal(Knob::Y));
-                if(after_gain < 0)
+                int32_t afterGain = main + apply_gain(CVIn1(), KnobVal(Knob::Y));
+                if(afterGain < 0)
                     main = 0;
-                else if(after_gain > 4095)
+                else if(afterGain > 4095)
                     main = 4095;
                 else
-                    main = after_gain;
+                    main = afterGain;
             }
 
-            const uint16_t mainVal = log_scale_high(main);
-            const uint16_t mainVal2 = log_scale_high(4095 - main);
-            const uint16_t which = rnd();
+            const uint16_t mainScaled = LogScale(main);
+            const uint16_t mainScaledInv = LogScale(4095 - main);
+            const uint16_t which = Rnd();
 
             int16_t noise = 0;
             if(Connected(Input::Audio2))
                 noise = AudioIn2();
             else
-                noise = rnd12() - 2048;
+                noise = Rnd12() - 2048;
 
             // if there is audio in ringmod the noise with it
             if(Connected(Input::Audio1))
-                noise = ring_mod(noise, AudioIn1());
+                noise = RingMod(noise, AudioIn1());
+
+
+            if(SwitchVal() == Switch::Up)
+                noise = (noise >> 10) << 10;
 
             AudioOut1(0);
             AudioOut2(0);
 
-            if(which < mainVal)
+            if(which < mainScaled)
                 AudioOut1(noise);
 
-            if (which < mainVal2)
+            if (which < mainScaledInv)
                 AudioOut2(noise);
 
             /* CVOut1(KnobVal(Knob::Y) - 2048); */
@@ -161,14 +139,14 @@ class NoiseTools : public ComputerCard
             CVOut1(BIT_12_MIN);
 
             if (PulseIn2RisingEdge())
-                s_and_h_value = noise;
+                sampleHoldValue = noise;
 
-            CVOut2(s_and_h_value);
+            CVOut2(sampleHoldValue);
 
             LedBrightness(0, main);
 
             // regular gate thing
-            if(gate_out_1_c < 512)
+            if(gateOut1Count < 512)
             {
                 PulseOut1(true);
                 LedOn(1, true);
@@ -177,8 +155,8 @@ class NoiseTools : public ComputerCard
                 PulseOut1(false);
                 LedOn(1, false);
             }
-            gate_out_1_c++;
 
+            gateOut1Count++;
         }
 };
 
