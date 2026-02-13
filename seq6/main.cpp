@@ -1,9 +1,20 @@
 #include "ComputerCard.h"
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
+#include "BucketBrigadeDelay.h"
 ///
 class Seq6 : public ComputerCard
 {
+    static constexpr uint8_t  NUM_STAGES       = 6;
+    static constexpr uint16_t DEFAULT_STEP_LEN = 48000 / 2;
+    static constexpr uint16_t GATE_PRE_COUNT   = 48;
+    static constexpr uint16_t GATE2_PULSE_LEN  = 96;
+    static constexpr uint8_t  MIN_NOTE         = 48;
+    static constexpr uint8_t  NOTE_RANGE       = 36;
+    static constexpr uint8_t  EDIT_NOTE_OFFSET = 32;
+    static constexpr uint8_t  EDIT_NOTE_RANGE  = 72;
+    static constexpr uint32_t BBD_MAX_DELAY    = 65535 * 4;
+
     struct Stage {
         uint8_t steps = 1; //1-6
         uint8_t note = 60;
@@ -12,69 +23,47 @@ class Seq6 : public ComputerCard
     };
 
     class Gate {
-
         private:
             uint32_t count = 0;
             uint16_t pre_count = 0;
-            uint8_t pulse = 0;
-            Seq6* parent;  // ← Reference to parent object
         public:
-            Gate(Seq6* p, uint8_t pulse) : count(0), pulse(pulse), parent(p) { }
+            Gate() : count(0) {}
 
-            void Activate(uint32_t num_samples)
-            {
-                this->count = num_samples;
-            }
+            void Activate(uint32_t num_samples) { count = num_samples; }
+            bool IsActive() { return count != 0; }
 
-            bool IsActive()
-            {
-                return count != 0;
-            }
-
-            void Reset()
-            {
+            void Reset() {
                 count = 0;
-                pre_count = 48;
-                parent->PulseOut(pulse, false);
+                pre_count = GATE_PRE_COUNT;
             }
 
-            void Tick()
-            {
-                if(pre_count == 0 && IsActive())
-                {
+            bool Tick() {
+                if (pre_count == 0 && IsActive()) {
                     count--;
-                    parent->PulseOut(pulse, true);
+                    return true;
                 }
-                else
-                {
-                    if(pre_count > 0)
-                        pre_count--;
-
-                    parent->PulseOut(pulse, false);
-                }
+                if (pre_count > 0)
+                    pre_count--;
+                return false;
             }
     };
 
 
     private:
 
-        Stage stages[6];
-        Gate gate1 = Gate(this, 0);
-        uint16_t step_len_samples = 48000 / 2;
-        uint16_t step_len_c = 0;
+        Stage stages[NUM_STAGES];
+        Gate gate1;
+        Gate gate2;
+        uint16_t step_len_samples = DEFAULT_STEP_LEN;
+        uint16_t step_len_counter = 0;
         uint8_t current_stage = 0;
-        uint8_t next_step = 0;
+        uint8_t steps_completed = 0;
         Switch last_switch_val = Switch::Up;
-        int16_t audioOut2Value = 0;
+        int16_t sample_and_hold = 0;
         bool reset = true;
+        static BucketBrigadeDelay bbdDelay;
 
         uint32_t lcg_seed = getRandomSeed();
-        uint16_t rnd12() noexcept
-        {
-            static uint32_t rnd12_seed = static_cast<uint32_t>(UniqueCardID());
-            rnd12_seed = 1664525 * rnd12_seed + 1013904223;
-            return rnd12_seed >> 20;
-        }
 
         uint32_t getRandomSeed() {
             adc_set_temp_sensor_enabled(true);
@@ -93,10 +82,12 @@ class Seq6 : public ComputerCard
             lcg_seed = 1664525 * lcg_seed + 1013904223;
             return lcg_seed >> 16;
         }
-        /* inline int16_t lerp12(int16_t a, int16_t b, uint8_t fract) */
-        /* { */
-        /*     return a + (((b - a) * fract) >> 8); */
-        /* } */
+
+        uint16_t rnd_12bit() noexcept
+        {
+            return rnd() >> 4;
+        }
+
         inline uint16_t log_scale(uint16_t input) noexcept
         {
             if (input == 0) return 0;
@@ -120,161 +111,184 @@ class Seq6 : public ComputerCard
             return base + (((next - base) * fraction) >> 8);
         }
 
+        void processAudio()
+        {
+            if (Connected(Input::Audio1) && !Connected(Input::Audio2))
+            {
+                bbdDelay.setDelaySamples(step_len_samples);
+                bbdDelay.setFeedback(160);
+                AudioOut1(bbdDelay.process(AudioIn1()));
+            }
+            else if (Connected(Input::Audio2))
+            {
+                auto delaySamples = step_len_samples << 1;
+                if (Connected(Input::Audio1))
+                    delaySamples = delaySamples + step_len_samples;
+
+                bbdDelay.setFeedback(128);
+                bbdDelay.setDelaySamples(delaySamples);
+                AudioOut1(bbdDelay.process(AudioIn2()));
+            }
+            else
+            {
+                // noise and s&h
+                AudioOut1(rnd_12bit() - 2048);
+            }
+
+            AudioOut2(sample_and_hold);
+        }
+
+        void processPlayback()
+        {
+            if (PulseIn2RisingEdge())
+                reset = true;
+
+            Stage stage = stages[current_stage];
+            CVOutMIDINote(0, stage.note);
+            CVOutMIDINote(1, stage.note);
+
+            PulseOut(0, gate1.Tick());
+            PulseOut(1, gate2.Tick());
+
+            if (gate1.IsActive())
+                LedOn(current_stage, true);
+
+            if (PulseIn1RisingEdge() ||
+                    (!Connected(Input::Pulse1) &&
+                     step_len_counter >= step_len_samples))
+            {
+                step_len_samples = step_len_counter;
+                step_len_counter = 0;
+
+                if (reset)
+                {
+                    current_stage = 0;
+                    steps_completed = 0;
+                    gate1.Reset();
+                    auto gate_len =
+                        (stages[current_stage].steps * step_len_samples) >> 1;
+                    gate1.Activate(gate_len);
+                    gate2.Activate(GATE2_PULSE_LEN);
+                    sample_and_hold = rnd_12bit() - 2048;
+                    reset = false;
+                }
+                else if (steps_completed >= stage.steps - 1)
+                {
+                    // enough steps, advance to next stage
+                    steps_completed = 0;
+
+                    if (++current_stage == NUM_STAGES)
+                        current_stage = 0;
+                    // 50% step length
+                    auto gate_len =
+                        (stages[current_stage].steps * step_len_samples) >> 1;
+                    gate1.Activate(gate_len);
+                    gate2.Activate(GATE2_PULSE_LEN);
+                    // s&h
+                    sample_and_hold = rnd_12bit() - 2048;
+                }
+                else
+                {
+                    steps_completed++;
+                }
+            }
+            else
+            {
+                step_len_counter++;
+            }
+        }
+
+        void processManual()
+        {
+            gate1.Activate(10);
+            gate2.Activate(1);
+            PulseOut(0, gate1.Tick());
+            PulseOut(1, gate2.Tick());
+            current_stage = (KnobVal(Knob::Y) * NUM_STAGES) >> 12;
+            LedOn(current_stage, true);
+            Stage stage = stages[current_stage];
+            CVOutMIDINote(0, stage.note);
+            CVOutMIDINote(1, stage.note);
+        }
+
+        // "Catch" editing: knob must first match the current value before
+        // changes are applied, preventing jumps when switching stages.
+        void processEdit(Switch switchVal)
+        {
+            for (int i = 0; i < NUM_STAGES; i++)
+                LedOff(i);
+
+            Stage& stage = stages[current_stage];
+
+            // first frame after switching: disable editing until knobs catch
+            if (switchVal != last_switch_val)
+            {
+                stage.editable = false;
+                stage.stepsEditable = false;
+            }
+
+            auto knobNote = EDIT_NOTE_OFFSET + ((KnobVal(Knob::Main) * EDIT_NOTE_RANGE) >> 12);
+
+            if (!stage.editable && stage.note == knobNote)
+                stage.editable = true;
+
+            if (stage.editable)
+                stage.note = knobNote;
+
+            auto stepsValue = ((KnobVal(Knob::X) * NUM_STAGES) >> 12) + 1;
+
+            if (!stage.stepsEditable && stage.steps == stepsValue)
+                stage.stepsEditable = true;
+
+            if (stage.stepsEditable)
+                stage.steps = stepsValue;
+
+            for (int i = 0; i < stage.steps; i++)
+                LedBrightness(i, 512);
+
+            if (stage.editable)
+                LedOn(0);
+
+            if (stage.stepsEditable)
+                LedOn(stage.steps - 1);
+
+            CVOutMIDINote(0, stage.note);
+            CVOutMIDINote(1, stage.note);
+        }
+
     public:
         Seq6()
         {
-            /* lcg_seed = KnobVal(Knob::Main); */
-            //initialise to random note values
-            for(int i = 0; i < 6; i++)
+            for (int i = 0; i < NUM_STAGES; i++)
             {
-                stages[i].note = 48 + rnd() % 36;
+                stages[i].note = MIN_NOTE + rnd() % NOTE_RANGE;
                 stages[i].steps = 1 + (rnd() % 5);
             }
+
+            bbdDelay.setDelaySamples(12000);
         }
 
         virtual void ProcessSample() override
         {
+            processAudio();
 
-            // noise and s&h
-            AudioOut1(rnd12() - 2048);
-            AudioOut2(audioOut2Value);
-
-            for(int i = 0; i < 6; i++)
+            for (int i = 0; i < NUM_STAGES; i++)
                 LedOn(i, false);
-
 
             auto switchVal = SwitchVal();
             switch (switchVal)
             {
-                case Switch::Up:
-                {
-                    // handle reset
-                    if(PulseIn2RisingEdge())
-                    {
-                        reset = true;
-                    }
-
-                    Stage stage = stages[current_stage];
-                    // always set the note value
-                    CVOutMIDINote(0, stage.note);
-                    CVOutMIDINote(1, stage.note);
-
-                    gate1.Tick();
-
-                    if(gate1.IsActive())
-                        LedOn(current_stage, true);
-
-                    if (PulseIn1RisingEdge() ||
-                            (!Connected(Input::Pulse1) &&
-                             step_len_c >= step_len_samples))
-                    {
-                        step_len_samples = step_len_c;
-                        step_len_c = 0;
-                        //adjust step_len_samples based on incoming pulses
-                        if(reset)
-                        {
-                            current_stage = 0;
-                            next_step = 0;
-                            gate1.Reset();
-                            auto gate_len =
-                                (stages[current_stage].steps * step_len_samples) >> 1;
-                            gate1.Activate(gate_len);
-                            audioOut2Value = rnd12() - 2048;
-                            reset = false;
-                        }
-                        else if(next_step >= stage.steps - 1)
-                        {
-                            //enough steps, increment stage
-                            next_step = 0;
-
-                            /* current_stage++; */
-                            if(++current_stage == 6)
-                                current_stage = 0;
-                            // 50% step length
-                            auto gate_len =
-                                (stages[current_stage].steps * step_len_samples) >> 1;
-                            gate1.Activate(gate_len);
-                            // s&h
-                            audioOut2Value = rnd12() - 2048;
-                        }
-                        else
-                        {
-                            next_step++;
-                        }
-
-                    }
-                    else
-                    {
-                        step_len_c++;
-                    }
-
-                    //playback
-                    break;
-                };
-                case Switch::Middle:
-                {
-                    gate1.Activate(10);
-                    gate1.Tick();
-                    current_stage = (KnobVal(Knob::Y) * 6) >> 12;
-                    LedOn(current_stage, true);
-                    Stage stage = stages[current_stage];
-                    CVOutMIDINote(0, stage.note);
-                    CVOutMIDINote(1, stage.note);
-                    break;
-                };
-                case Switch::Down:
-                {
-                    for(int i = 0; i < 6; i++)
-                        LedOff(i);
-
-                    Stage& stage = stages[current_stage];
-                    //it is the first time after a switch, set ediable = false
-                    if(switchVal != last_switch_val)
-                    {
-                        stage.editable = false;
-                        stage.stepsEditable = false;
-                    }
-
-                    auto knobNote = 32 + ((KnobVal(Knob::Main) * 72) >> 12);
-
-                    if(!stage.editable && stage.note == knobNote)
-                        stage.editable = true;
-
-                    //implement "catch" approach
-                    if(stage.editable)
-                        stage.note = knobNote;
-
-                    auto stepsValue = ((KnobVal(Knob::X) * 6) >> 12) + 1;
-
-                    if(!stage.stepsEditable && stage.steps == stepsValue)
-                        stage.stepsEditable = true;
-
-                    if(stage.stepsEditable)
-                        stage.steps = stepsValue;
-
-                    for(int i = 0; i < stage.steps; i++)
-                        LedBrightness(i, 512);
-
-                    /* LedOn(stage.steps - 1, true); */
-                    if(stage.editable)
-                        LedOn(0);
-
-                    if(stage.stepsEditable)
-                        LedOn(stage.steps - 1);
-
-                    CVOutMIDINote(0, stage.note);
-                    CVOutMIDINote(1, stage.note);
-                    break;
-                };
-                default:
-                {}
-
-            };
+                case Switch::Up:     processPlayback();      break;
+                case Switch::Middle: processManual();         break;
+                case Switch::Down:   processEdit(switchVal);  break;
+                default: break;
+            }
 
             last_switch_val = switchVal;
         }
 };
 
+BucketBrigadeDelay Seq6::bbdDelay(BBD_MAX_DELAY, 200, 0, 128, 20000);
 
 int main()
 {
@@ -282,5 +296,3 @@ int main()
     seq.EnableNormalisationProbe();
 	seq.Run();
 }
-
-
