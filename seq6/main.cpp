@@ -113,6 +113,21 @@ class Seq6 : public ComputerCard
             return base + (((next - base) * fraction) >> 8);
         }
 
+        // 25-50% zone on main knob: increasing probability of ±octave shift
+        void maybeOctaveShift(uint8_t& note)
+        {
+            auto knob = KnobVal(Knob::Main);
+            if (knob > 1024 && knob <= 2048) {
+                uint32_t prob = ((knob - 1024) * 65535) / 1024;
+                if (rnd() < prob) {
+                    if (rnd() & 1)
+                        note = (note + 12 <= 127) ? note + 12 : note - 12;
+                    else
+                        note = (note >= 12) ? note - 12 : note + 12;
+                }
+            }
+        }
+
         void applyReset()
         {
             current_stage = 0;
@@ -179,6 +194,12 @@ class Seq6 : public ComputerCard
             PulseOut(0, gate1.Tick());
             PulseOut(1, gate2.Tick());
 
+            // dim LED to indicate main knob performance zone
+            // 0: forward, 1: octave shift, 2: reverse, 3: random
+            auto knobMain = KnobVal(Knob::Main);
+            uint8_t zone = (knobMain > 3072) ? 3 : (knobMain > 2048) ? 2 : (knobMain > 1024) ? 1 : 0;
+            LedBrightness(zone, 256);
+
             if (gate1.IsActive())
                 LedOn(current_stage, true);
 
@@ -215,21 +236,13 @@ class Seq6 : public ComputerCard
                             current_stage = 0;
                     }
 
-                    // 25-50%: increasing probability of octave shift
-                    if (knob > 1024 && knob <= 2048) {
-                        uint32_t prob = ((knob - 1024) * 65535) / 1024;
-                        if (rnd() < prob) {
-                            auto& note = stages[current_stage].note;
-                            if (rnd() & 1)
-                                note = (note + 12 <= 127) ? note + 12 : note - 12;
-                            else
-                                note = (note >= 12) ? note - 12 : note + 12;
-                        }
-                    }
+                    maybeOctaveShift(stages[current_stage].note);
 
-                    // 50% step length
-                    auto gate_len =
-                        (stages[current_stage].steps * step_len_samples) >> 1;
+                    // Y knob > 50%: retrigger gate on every step
+                    bool retrigger = KnobVal(Knob::Y) > 2048;
+                    auto gate_len = retrigger
+                        ? step_len_samples >> 1
+                        : (stages[current_stage].steps * step_len_samples) >> 1;
                     gate1.Activate(gate_len);
                     gate2.Activate(GATE2_PULSE_LEN);
                     // s&h
@@ -238,6 +251,13 @@ class Seq6 : public ComputerCard
                 else
                 {
                     steps_completed++;
+                    // retrigger: re-fire gate on intermediate steps
+                    if (KnobVal(Knob::Y) > 2048) {
+                        maybeOctaveShift(stages[current_stage].note);
+                        gate1.Reset();
+                        gate1.Activate(step_len_samples >> 1);
+                        gate2.Activate(GATE2_PULSE_LEN);
+                    }
                 }
             }
             else
