@@ -139,25 +139,32 @@ class Seq6 : public ComputerCard
             gate1.Activate(gate_len);
             gate2.Activate(GATE2_PULSE_LEN);
             sample_and_hold = rnd_12bit() - 2048;
+            updateDelayTime();
             reset = false;
+        }
+
+        void updateDelayTime()
+        {
+            if (Connected(Input::Audio1) && !Connected(Input::Audio2)) {
+                bbdDelay.setDelaySamples(step_len_samples);
+                bbdDelay.setFeedback(160);
+            } else if (Connected(Input::Audio2)) {
+                auto delaySamples = step_len_samples << 1;
+                if (Connected(Input::Audio1))
+                    delaySamples = delaySamples + step_len_samples;
+                bbdDelay.setFeedback(128);
+                bbdDelay.setDelaySamples(delaySamples);
+            }
         }
 
         void processAudio()
         {
             if (Connected(Input::Audio1) && !Connected(Input::Audio2))
             {
-                bbdDelay.setDelaySamples(step_len_samples);
-                bbdDelay.setFeedback(160);
                 AudioOut1(bbdDelay.process(AudioIn1()));
             }
             else if (Connected(Input::Audio2))
             {
-                auto delaySamples = step_len_samples << 1;
-                if (Connected(Input::Audio1))
-                    delaySamples = delaySamples + step_len_samples;
-
-                bbdDelay.setFeedback(128);
-                bbdDelay.setDelaySamples(delaySamples);
                 AudioOut1(bbdDelay.process(AudioIn2()));
             }
             else
@@ -210,6 +217,7 @@ class Seq6 : public ComputerCard
                 if (Connected(Input::Pulse1))
                     step_len_samples = step_len_counter;
                 step_len_counter = 0;
+                updateDelayTime();
 
                 if (reset)
                 {
