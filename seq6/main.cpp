@@ -14,6 +14,8 @@ class Seq6 : public ComputerCard
     static constexpr uint8_t  EDIT_NOTE_OFFSET = 32;
     static constexpr uint8_t  EDIT_NOTE_RANGE  = 72;
     static constexpr uint32_t BBD_MAX_DELAY    = 65535 * 4;
+    static constexpr uint16_t MIN_STEP_LEN     = 2880;   // ~60ms at 48kHz
+    static constexpr uint16_t MAX_STEP_LEN     = 48000;  // 1s
 
     struct Stage {
         uint8_t steps = 1; //1-6
@@ -111,6 +113,20 @@ class Seq6 : public ComputerCard
             return base + (((next - base) * fraction) >> 8);
         }
 
+        void applyReset()
+        {
+            current_stage = 0;
+            steps_completed = 0;
+            step_len_counter = 0;
+            gate1.Reset();
+            auto gate_len =
+                (stages[current_stage].steps * step_len_samples) >> 1;
+            gate1.Activate(gate_len);
+            gate2.Activate(GATE2_PULSE_LEN);
+            sample_and_hold = rnd_12bit() - 2048;
+            reset = false;
+        }
+
         void processAudio()
         {
             if (Connected(Input::Audio1) && !Connected(Input::Audio2))
@@ -140,8 +156,21 @@ class Seq6 : public ComputerCard
 
         void processPlayback()
         {
-            if (PulseIn2RisingEdge())
-                reset = true;
+            // X knob controls tempo when no pulse input connected
+            if (!Connected(Input::Pulse1)) {
+                auto knobX = KnobVal(Knob::X);
+                step_len_samples = MAX_STEP_LEN - (((uint32_t)knobX * (MAX_STEP_LEN - MIN_STEP_LEN)) >> 12);
+            }
+
+            if (PulseIn2RisingEdge()) {
+                if (Connected(Input::Pulse1)) {
+                    // external clock: defer reset to next clock edge
+                    reset = true;
+                } else {
+                    // internal clock: reset immediately
+                    applyReset();
+                }
+            }
 
             Stage stage = stages[current_stage];
             CVOutMIDINote(0, stage.note);
@@ -157,28 +186,47 @@ class Seq6 : public ComputerCard
                     (!Connected(Input::Pulse1) &&
                      step_len_counter >= step_len_samples))
             {
-                step_len_samples = step_len_counter;
+                if (Connected(Input::Pulse1))
+                    step_len_samples = step_len_counter;
                 step_len_counter = 0;
 
                 if (reset)
                 {
-                    current_stage = 0;
-                    steps_completed = 0;
-                    gate1.Reset();
-                    auto gate_len =
-                        (stages[current_stage].steps * step_len_samples) >> 1;
-                    gate1.Activate(gate_len);
-                    gate2.Activate(GATE2_PULSE_LEN);
-                    sample_and_hold = rnd_12bit() - 2048;
-                    reset = false;
+                    applyReset();
                 }
                 else if (steps_completed >= stage.steps - 1)
                 {
                     // enough steps, advance to next stage
                     steps_completed = 0;
 
-                    if (++current_stage == NUM_STAGES)
-                        current_stage = 0;
+                    // performance knob: 4 zones
+                    // 0-25% forward | 25-50% forward+octave shift | 50-75% reverse | 75-100% random
+                    auto knob = KnobVal(Knob::Main);
+
+                    if (knob > 3072) {
+                        // random stage
+                        current_stage = rnd() % NUM_STAGES;
+                    } else if (knob > 2048) {
+                        // reverse
+                        current_stage = (current_stage == 0) ? NUM_STAGES - 1 : current_stage - 1;
+                    } else {
+                        // forward
+                        if (++current_stage == NUM_STAGES)
+                            current_stage = 0;
+                    }
+
+                    // 25-50%: increasing probability of octave shift
+                    if (knob > 1024 && knob <= 2048) {
+                        uint32_t prob = ((knob - 1024) * 65535) / 1024;
+                        if (rnd() < prob) {
+                            auto& note = stages[current_stage].note;
+                            if (rnd() & 1)
+                                note = (note + 12 <= 127) ? note + 12 : note - 12;
+                            else
+                                note = (note >= 12) ? note - 12 : note + 12;
+                        }
+                    }
+
                     // 50% step length
                     auto gate_len =
                         (stages[current_stage].steps * step_len_samples) >> 1;
