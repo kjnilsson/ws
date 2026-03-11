@@ -1,225 +1,164 @@
 #include "ComputerCard.h"
-
 #include <stdint.h>
 
-class CNoteDetector {
-private:
-    static const uint16_t SAMPLE_RATE = 48000;  // Adjust based on your ADC setup
-    static const uint16_t WINDOW_SIZE = 1024;    // Power of 2 for efficient operations
-    static const uint8_t NUM_C_NOTES = 8;       // C0 to C7
+// Detects pitch by measuring the period between positive-going zero crossings.
+// Averages AVG_PERIODS consecutive periods for stability.
+class PitchDetector {
+    static const uint16_t MIN_PERIOD  = 12;    // 4 kHz max  (48000/4000)
+    static const uint16_t MAX_PERIOD  = 2400;  // 20 Hz min  (48000/20)
+    static const uint8_t  AVG_PERIODS = 8;
 
-    // Pre-calculated C note frequencies in mHz (millihertz) to avoid floats
-    static const uint32_t C_FREQUENCIES_MHZ[NUM_C_NOTES];
+    bool     above;
+    uint32_t since_last;   // samples since last positive crossing
+    uint32_t timeout;      // samples since any crossing (silence detection)
 
-    // Autocorrelation buffer
-    int16_t samples[WINDOW_SIZE];
-    uint16_t sample_index;
-    bool buffer_full;
+    uint32_t periods[AVG_PERIODS];
+    uint8_t  pi;           // ring-buffer write index
+    uint8_t  count;        // valid periods accumulated
 
-    // Fixed-point arithmetic helpers
-    static const uint8_t FIXED_POINT_SHIFT = 10;  // 1024 units per 1.0
-
-    // Calculate autocorrelation for a given lag
-    int32_t autocorrelate(uint16_t lag) {
-        if (!buffer_full && sample_index < WINDOW_SIZE) return 0;
-
-        int32_t sum = 0;
-        uint16_t count = WINDOW_SIZE - lag;
-
-        for (uint16_t i = 0; i < count; i++) {
-            sum += (int32_t)samples[i] * samples[i + lag];
-        }
-
-        return sum / count;
-    }
-
-    // Find fundamental frequency using autocorrelation
-    uint32_t detectPitch() {
-        int32_t max_correlation = 0;
-        uint16_t best_lag = 0;
-
-        // Search for lag between 20Hz and 4kHz
-        uint16_t min_lag = SAMPLE_RATE / 4000;  // 4kHz max
-        uint16_t max_lag = SAMPLE_RATE / 20;    // 20Hz min
-
-        // Find the lag with maximum autocorrelation
-        for (uint16_t lag = min_lag; lag < max_lag && lag < WINDOW_SIZE / 2; lag++) {
-            int32_t correlation = autocorrelate(lag);
-
-            if (correlation > max_correlation) {
-                max_correlation = correlation;
-                best_lag = lag;
-            }
-        }
-
-        if (best_lag == 0) return 0;
-
-        // Convert lag to frequency in mHz
-        return (SAMPLE_RATE * 1000UL) / best_lag;
-    }
-
-    // Calculate cents difference between two frequencies
-    int16_t frequencyToCents(uint32_t freq_mhz, uint32_t ref_freq_mhz) {
-        if (freq_mhz == 0 || ref_freq_mhz == 0) return 2047;
-
-        // Approximate log2 ratio using fixed-point arithmetic
-        // cents = 1200 * log2(freq/ref)
-
-        // Find octave difference first
-        int16_t octave_diff = 0;
-        uint32_t f = freq_mhz;
-        uint32_t r = ref_freq_mhz;
-
-        while (f >= r * 2) {
-            f /= 2;
-            octave_diff++;
-        }
-        while (f * 2 <= r) {
-            f *= 2;
-            octave_diff--;
-        }
-
-        // Now f and r are within one octave
-        // Use linear approximation for small differences
-        int32_t ratio = ((int32_t)f - (int32_t)r) * 1200 / (int32_t)r;
-
-        return octave_diff * 1200 + ratio;
-    }
+    uint32_t result;       // averaged period (samples), 0 = unknown
 
 public:
-    CNoteDetector() : sample_index(0), buffer_full(false) {
-        // Initialize sample buffer
-        for (uint16_t i = 0; i < WINDOW_SIZE; i++) {
-            samples[i] = 0;
-        }
+    PitchDetector() : above(false), since_last(0), timeout(0),
+                      pi(0), count(0), result(0) {
+        for (uint8_t i = 0; i < AVG_PERIODS; i++) periods[i] = 0;
     }
 
-    // Add a new 12-bit sample (0-4095)
-    void addSample(int16_t signed_sample) {
-        samples[sample_index] = signed_sample;
-        sample_index++;
+    void addSample(int16_t s) {
+        since_last++;
+        timeout++;
 
-        if (sample_index >= WINDOW_SIZE) {
-            sample_index = 0;
-            buffer_full = true;
-        }
-    }
-
-    // Get closeness to nearest C note (-2048 to 2047)
-    int16_t getCloseness() {
-        uint32_t detected_freq_mhz = detectPitch();
-
-        if (detected_freq_mhz == 0) {
-            return -2048;  // No pitch detected
-        }
-
-        // Find closest C note
-        int32_t min_cents_diff = 32767;  // Large initial value
-        bool is_above = true;
-
-        for (uint8_t i = 0; i < NUM_C_NOTES; i++) {
-            int16_t cents_diff = frequencyToCents(detected_freq_mhz, C_FREQUENCIES_MHZ[i]);
-            int16_t abs_cents_diff = cents_diff < 0 ? -cents_diff : cents_diff;
-
-            if (abs_cents_diff < min_cents_diff) {
-                min_cents_diff = abs_cents_diff;
-                is_above = cents_diff > 0;
+        if (!above && s > 256) {
+            above = true;
+            if (since_last >= MIN_PERIOD && since_last <= MAX_PERIOD) {
+                periods[pi] = since_last;
+                pi = (pi + 1) % AVG_PERIODS;
+                if (count < AVG_PERIODS) count++;
+                if (count >= AVG_PERIODS) {
+                    uint32_t sum = 0;
+                    for (uint8_t i = 0; i < AVG_PERIODS; i++) sum += periods[i];
+                    result = sum / AVG_PERIODS;
+                }
+            } else {
+                // Period out of range — discard history
+                count  = 0;
+                pi     = 0;
+                result = 0;
             }
+            since_last = 0;
+            timeout    = 0;
+        } else if (above && s < -256) {
+            above = false;
         }
 
-        // Convert cents to output range
-        // 0 cents = 0 output (perfect match)
-        // 50 cents = ±2047 output (quarter tone away)
-        // Linear mapping: output = (cents * 2047) / 50
-
-        int32_t output = (min_cents_diff * 2047L) / 600;
-
-        // Clamp to range
-        if (output > 2047) output = 2047;
-
-        // Apply sign based on whether we're above or below the C note
-        return is_above ? (int16_t)output : -(int16_t)output;
+        // No crossing for >100 ms: declare silence
+        if (timeout > 4800) {
+            result     = 0;
+            count      = 0;
+            pi         = 0;
+            since_last = 0;
+            timeout    = 0;
+            above      = false;
+        }
     }
-    // Process a block of samples and return closeness
-    int16_t processBlock(uint16_t* block, uint16_t block_size) {
-        for (uint16_t i = 0; i < block_size; i++) {
-            addSample(block[i]);
-        }
-        return getCloseness();
+
+    // Returns averaged period in samples, or 0 if not yet determined.
+    uint32_t period() const {
+        return (count >= AVG_PERIODS) ? result : 0;
     }
 };
 
-// C note frequencies in millihertz (C0 to C7)
-const uint32_t CNoteDetector::C_FREQUENCIES_MHZ[CNoteDetector::NUM_C_NOTES] = {
-    16352,   // C0
-    32703,   // C1
-    65406,   // C2
-    130813,  // C3
-    261626,  // C4 (Middle C)
-    523251,  // C5
-    1046502, // C6
-    2093005  // C7
-};
-class Tnr : public ComputerCard
-{
-public:
+// Convert a period (samples at 48 kHz) to deviation from the nearest C note.
+//
+// Returns INT16_MIN if no pitch.
+// Returns  0        if perfectly in tune with a C.
+// Returns +2047     if ≥ 50 cents sharp  (above C).
+// Returns -2047     if ≥ 50 cents flat   (below C).
+static int16_t periodToCloseness(uint32_t period_samples) {
+    if (period_samples == 0) return INT16_MIN;
+
+    // Frequency in mHz (avoids floats; 48 MHz fits in uint32_t)
+    uint32_t f = 48000000UL / period_samples;
+
+    // Octave-reduce into [C4, C5) = [261626, 523251) mHz
+    const uint32_t C4 = 261626;
+    const uint32_t C5 = 523251;
+    while (f < C4) f <<= 1;
+    while (f >= C5) f >>= 1;
+
+    // Cents deviation using first-order log approximation:
+    //   cents ≈ (1200/ln2) × (f−C)/C  ≈  1731 × (f−C)/C
+    // This is accurate to within ~2% for deviations up to ±100 cents.
+    // At larger deviations the display saturates anyway, so sign is what matters.
+    //
+    // Geometric midpoint between C4 and C5 is at ~370 000 mHz (600 cents).
+    // Above that, compare to C5 to get the correct (negative) sign.
+    int32_t cents;
+    if (f >= 370000UL) {
+        cents = -(int32_t)((C5 - f) * 1731UL / C5);
+    } else {
+        cents = (int32_t)((f - C4) * 1731UL / C4);
+    }
+
+    // Scale ±600 cents (6 semitones) to ±2047 and clamp
+    int32_t out = cents * 2047L / 600;
+    if (out >  2047) out =  2047;
+    if (out < -2047) out = -2047;
+    return (int16_t)out;
+}
+
+class Tnr : public ComputerCard {
+    PitchDetector pd1, pd2;
     uint8_t counter;
-    CNoteDetector nd;
 
-    Tnr()
-    {
-        nd = CNoteDetector();
-        counter = 0;
+    // Drive three LEDs for one tuner channel.
+    //   c range: -2047..+2047 = -600..+600 cents; INT16_MIN = no signal
+    //   ledSharp (LED 0): fades in from off (600 cents sharp) to full (just above C), snaps off at C
+    //   ledCenter(LED 2): full at C, zero outside ±200 cents
+    //   ledFlat  (LED 4): fades in from off (600 cents flat)  to full (just below C), snaps off at C
+    void updateLeds(int16_t c, uint8_t ledFlat, uint8_t ledCenter, uint8_t ledSharp) {
+        if (c == INT16_MIN) {
+            LedBrightness(ledFlat,   0);
+            LedBrightness(ledCenter, 0);
+            LedBrightness(ledSharp,  0);
+            return;
+        }
+        int16_t absC = c < 0 ? -c : c;
+
+        // Side LEDs: bright when off-pitch, fade to zero as C is approached
+        int32_t side   = 4095L * absC          / 2047;
+
+        // Center LED: zero when off-pitch, fades to full as C is approached
+        int32_t center = 4095L * (2047 - absC) / 2047;
+
+        LedBrightness(ledCenter, (uint16_t)center);
+        LedBrightness(ledFlat,   c < 0 ? (uint16_t)side : 0);
+        LedBrightness(ledSharp,  c > 0 ? (uint16_t)side : 0);
     }
 
-    inline int16_t abs(int16_t x) {
-        int16_t mask = x >> 15;  // Sign bit replicated to all bits
-        return (x ^ mask) - mask;
-    }
+public:
+    Tnr() : counter(0) {}
 
-	virtual void ProcessSample()
-	{
+    virtual void ProcessSample() override {
+        // Both CV outputs emit middle C
         CVOutMIDINote(0, 60);
         CVOutMIDINote(1, 60);
 
-        nd.addSample(AudioIn1());
+        pd1.addSample(AudioIn1());
+        pd2.addSample(AudioIn2());
 
-        if(!counter)
-        {
-            int16_t c = nd.getCloseness();
-            if(c == -2048)
-            {
-            }
-            else if(c == 0)
-            {
-                LedBrightness(0, 0);
-                LedOn(2, true);
-                LedBrightness(4, 0);
-            }
-            else if (c < 0)
-            {
-                int led4 = (abs(c) * 2);
-                LedBrightness(0, 0);
-                LedOn(2, false);
-                LedBrightness(4, led4);
-            } else
-            {
-                int led0 = (c * 2);
-                LedBrightness(0, led0);
-                LedOn(2, false);
-                LedBrightness(4, 0);
-            };
+        // Update display at ~187 Hz (every 256 samples)
+        if (!counter) {
+            // ledFlat=4, ledCenter=2, ledSharp=0  (0 = above C, 4 = below C)
+            updateLeds(periodToCloseness(pd1.period()), 4, 2, 0);
+            // ledFlat=5, ledCenter=3, ledSharp=1
+            updateLeds(periodToCloseness(pd2.period()), 5, 3, 1);
         }
         counter++;
-		LedBrightness(1, KnobVal(Knob::Main));
-	}
+    }
 };
 
-
-int main()
-{
-	Tnr pt;
-	pt.Run();
+int main() {
+    Tnr tnr;
+    tnr.Run();
 }
-
-
