@@ -23,9 +23,12 @@
 #include "ComputerCard.h"
 #include "MuLawCodec.h"
 #include "pico/multicore.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
 #include "tusb.h"
 #include "usb_midi_host.h"
 #include <math.h>
+#include <string.h>
 
 static MuLawCodec codec;
 
@@ -76,7 +79,15 @@ static const int      BUFFER_SIZE = RECORD_RATE * 6;          // 144 000 bytes �
 // the last crossfade output sample — no discontinuity, no click.
 static const int XFADE_LEN = 1024;
 
-static uint8_t sampleBuffer[BUFFER_SIZE];
+// Flash storage layout (end of 2 MB flash):
+//   last sector           = metadata  (magic, sampleLen, loopStartPt)
+//   preceding 36 sectors  = sample data  (36 × 4096 = 147456 bytes ≥ BUFFER_SIZE)
+static const uint32_t FLASH_DATA_SECTORS = ((uint32_t)BUFFER_SIZE + FLASH_SECTOR_SIZE - 1u) / FLASH_SECTOR_SIZE;  // 36
+static const uint32_t FLASH_DATA_OFFSET  = PICO_FLASH_SIZE_BYTES - (FLASH_DATA_SECTORS + 1u) * FLASH_SECTOR_SIZE;
+static const uint32_t FLASH_META_OFFSET  = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
+static const uint32_t FLASH_MAGIC        = 0x56535301u;  // 'V','S','S', version 1
+
+static uint8_t sampleBuffer[BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile int  sampleLen  = 0;
 static volatile bool hasSample  = false;
 
@@ -168,9 +179,78 @@ class VSS : public ComputerCard
 {
 public:
     VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0),
-            prevSwitchDown(false), loopStartPt(0), isUSBMIDIHost(false)
+            prevSwitchDown(false), prevSwitchUp(false),
+            loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false)
     {
+        loadFromFlash();                      // restore last sample before audio starts
         multicore_launch_core1(core1entry);
+    }
+
+    // ---- Flash load/save -----------------------------------------------
+
+    void loadFromFlash()
+    {
+        const uint8_t* meta = (const uint8_t*)(XIP_BASE + FLASH_META_OFFSET);
+        uint32_t magic; memcpy(&magic, meta, 4);
+        if (magic != FLASH_MAGIC) return;
+
+        int32_t len, lsp;
+        memcpy(&len, meta + 4, 4);
+        memcpy(&lsp, meta + 8, 4);
+        if (len <= 0 || len > BUFFER_SIZE) return;
+
+        memcpy(sampleBuffer, (const uint8_t*)(XIP_BASE + FLASH_DATA_OFFSET), (size_t)len);
+        sampleLen    = len;
+        loopStartPt  = lsp;
+        hasSample    = true;
+        savedToFlash = true;
+    }
+
+    void saveToFlash()
+    {
+        int len = sampleLen;
+        if (len <= 0 || !hasSample) return;
+
+        // Signal "saving" with all LEDs on
+        for (int i = 0; i < 6; i++) LedOn(i, true);
+
+        // Prepare metadata page (before entering the critical section so
+        // we don't call memcpy/memset while flash XIP is unavailable)
+        static uint8_t metaPage[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
+        memset(metaPage, 0, FLASH_PAGE_SIZE);
+        uint32_t magic = FLASH_MAGIC;
+        int32_t  iLen  = (int32_t)len;
+        int32_t  iLsp  = (int32_t)loopStartPt;
+        memcpy(metaPage,     &magic, 4);
+        memcpy(metaPage + 4, &iLen,  4);
+        memcpy(metaPage + 8, &iLsp,  4);
+
+        // Prepare last partial page (sampleBuffer may not fill an exact page multiple)
+        static uint8_t lastPage[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
+        uint32_t fullBytes = ((uint32_t)len / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+        uint32_t remaining = (uint32_t)len - fullBytes;
+        if (remaining > 0) {
+            memset(lastPage, 0, FLASH_PAGE_SIZE);
+            memcpy(lastPage, sampleBuffer + fullBytes, remaining);
+        }
+
+        // Critical section: disable all IRQs and park core 1 while we write
+        uint32_t ints = save_and_disable_interrupts();
+        multicore_lockout_start_blocking();
+
+        flash_range_erase(FLASH_DATA_OFFSET, (FLASH_DATA_SECTORS + 1u) * FLASH_SECTOR_SIZE);
+
+        if (fullBytes > 0)
+            flash_range_program(FLASH_DATA_OFFSET, sampleBuffer, fullBytes);
+        if (remaining > 0)
+            flash_range_program(FLASH_DATA_OFFSET + fullBytes, lastPage, FLASH_PAGE_SIZE);
+
+        flash_range_program(FLASH_META_OFFSET, metaPage, FLASH_PAGE_SIZE);
+
+        multicore_lockout_end_blocking();
+        restore_interrupts(ints);
+
+        savedToFlash = true;
     }
 
     // Boilerplate: call member function on core 1
@@ -180,6 +260,9 @@ public:
 
     void MIDICore()
     {
+        // Must be called before core 0 can use multicore_lockout_start_blocking()
+        multicore_lockout_victim_init();
+
         // Wait for USB power state to settle, then detect host vs device
         sleep_us(150000);
         USBPowerState_t pwr = USBPowerState();
@@ -346,11 +429,12 @@ public:
                     voices[i].active = false;
                     voices[i].state  = VS_IDLE;
                 }
-                writeHead   = 0;
-                sampleLen   = 0;
-                hasSample   = false;
-                loopStartPt = 0;
-                recording   = true;
+                writeHead    = 0;
+                sampleLen    = 0;
+                hasSample    = false;
+                loopStartPt  = 0;
+                savedToFlash = false;   // new recording invalidates any previous save
+                recording    = true;
             }
             if (writeHead < BUFFER_SIZE) {
                 // Decimate to 24 kHz: write one sample every two output ticks
@@ -373,6 +457,13 @@ public:
                 if (hasSample) computeLoopStart();
             }
         }
+
+        // --- Save to flash (switch Up, once per new recording) ---
+        bool switchUp    = (sw == Switch::Up);
+        bool switchJustUp = switchUp && !prevSwitchUp;
+        prevSwitchUp = switchUp;
+        if (switchJustUp && hasSample && !savedToFlash)
+            saveToFlash();   // blocks ~1 s; audio glitch is expected and acceptable
 
         // --- Preset selection from X knob ---
         presetIdx = (KnobVal(Knob::X) * NUM_PRESETS) >> 12;
@@ -500,6 +591,8 @@ public:
 private:
     bool         recording;
     bool         prevSwitchDown;
+    bool         prevSwitchUp;
+    bool         savedToFlash;
     bool         isUSBMIDIHost;
     int          writeHead;
     int          recordDecimate;  // toggles 0/1 to halve the recording sample rate

@@ -34,7 +34,7 @@ add_example(seq6)
 
 add_example(vss)
 target_include_directories(vss PUBLIC ${CMAKE_CURRENT_LIST_DIR}/vss/)
-target_link_libraries(vss pico_multicore tinyusb_host tinyusb_device tinyusb_board)
+target_link_libraries(vss pico_multicore tinyusb_host tinyusb_device tinyusb_board hardware_flash)
 target_sources(vss PUBLIC
   ${CMAKE_CURRENT_LIST_DIR}/vss/usb_midi_host.c
   ${CMAKE_CURRENT_LIST_DIR}/vss/usb_midi_host_app_driver.c
