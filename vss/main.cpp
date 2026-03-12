@@ -21,9 +21,12 @@
 //   5    = sample ready
 
 #include "ComputerCard.h"
+#include "MuLawCodec.h"
 #include "pico/multicore.h"
 #include "tusb.h"
 #include <math.h>
+
+static MuLawCodec codec;
 
 // ===========================================================
 // ADSR PRESETS  –  Edit these freely to taste!
@@ -59,7 +62,10 @@ static const int NUM_PRESETS = (int)(sizeof(PRESETS) / sizeof(PRESETS[0]));
 // Sample buffer  –  8-bit unsigned, ~2 seconds at 48 kHz
 // ===========================================================
 static const uint32_t SAMPLE_RATE = 48000;
-static const int      BUFFER_SIZE = (int)(SAMPLE_RATE * 4);   // 192 000 bytes ≈ 188 KB
+// Record at half the output rate (24 kHz) for a longer buffer.
+// Playback step is halved accordingly so pitch stays correct.
+static const int      RECORD_RATE = SAMPLE_RATE / 2;          // 24 kHz
+static const int      BUFFER_SIZE = RECORD_RATE * 6;          // 144 000 bytes ≈ 141 KB, 6 s
 
 // Loop crossfade length in samples (~5 ms at 48 kHz).
 // When pos enters the last XFADE_LEN samples before the loop end, we
@@ -67,7 +73,7 @@ static const int      BUFFER_SIZE = (int)(SAMPLE_RATE * 4);   // 192 000 bytes �
 // linearly blend between them.  After the wrap we resume from
 // loopStart + XFADE_LEN, so the first post-wrap output sample is adjacent to
 // the last crossfade output sample — no discontinuity, no click.
-static const int XFADE_LEN = 256;
+static const int XFADE_LEN = 1024;
 
 static uint8_t sampleBuffer[BUFFER_SIZE];
 static volatile int  sampleLen  = 0;
@@ -110,7 +116,7 @@ static uint32_t decayRateFn(uint32_t ms, uint32_t swing)
 // ===========================================================
 // Polyphonic voice
 // ===========================================================
-static const int NUM_VOICES = 4;
+static const int NUM_VOICES = 6;
 
 enum VoiceState : uint8_t { VS_IDLE, VS_ATTACK, VS_DECAY, VS_SUSTAIN, VS_RELEASE };
 
@@ -160,7 +166,7 @@ struct MIDIMsg {
 class VSS : public ComputerCard
 {
 public:
-    VSS() : recording(false), writeHead(0), presetIdx(0)
+    VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0), prevSwitchDown(false), loopStartPt(0)
     {
         multicore_launch_core1(core1entry);
     }
@@ -206,11 +212,12 @@ public:
 
         const ADSRPreset& p = PRESETS[presetIdx];
 
-        // Q8 playback step:  256 × 2^((note - 60) / 12)
+        // Q8 playback step: base is 128 (= 256/2) because recording is at
+        // half the output rate, so we advance half a sample per output tick.
         float semis = (float)((int)note - BASE_NOTE);
-        uint32_t step = (uint32_t)(256.0f * powf(2.0f, semis / 12.0f));
-        if (step <    8u) step =    8u;    // floor ~  5 octaves below base
-        if (step > 8192u) step = 8192u;    // cap   ~  5 octaves above base
+        uint32_t step = (uint32_t)(128.0f * powf(2.0f, semis / 12.0f));
+        if (step <   4u) step =   4u;    // floor ~  5 octaves below base
+        if (step > 4096u) step = 4096u;  // cap   ~  5 octaves above base
 
         // ADSR parameters
         uint32_t susLev   = (uint32_t)p.sustain * 257u;      // 0 .. 65535
@@ -263,33 +270,64 @@ public:
         }
     }
 
+    // Find the nearest upward zero crossing to sampleLen/2 and store it in
+    // loopStartPt.  Called once after each recording ends — blocking for a
+    // few hundred µs is inaudible because all voices are silent at that point.
+    void computeLoopStart()
+    {
+        int len     = sampleLen;
+        int nominal = len / 2;
+        int lo = nominal - XFADE_LEN;  if (lo < 1)    lo = 1;
+        int hi = nominal + XFADE_LEN;  if (hi >= len) hi = len - 1;
+
+        int best     = nominal;
+        int bestDist = XFADE_LEN + 1;
+
+        for (int i = lo; i < hi; i++) {
+            if (codec.decodeSample(sampleBuffer[i - 1]) <= 0 &&
+                codec.decodeSample(sampleBuffer[i])     >  0)
+            {
+                int dist = i - nominal;  if (dist < 0) dist = -dist;
+                if (dist < bestDist) { bestDist = dist; best = i; }
+            }
+        }
+        loopStartPt = best;
+    }
+
     // ---- Audio core (core 0) ----------------------------------------
 
     virtual void ProcessSample() override
     {
         // --- Recording (Z switch Down = momentary press) ---
         Switch sw = SwitchVal();
+        bool switchDown = (sw == Switch::Down);
+        bool switchJustPressed = switchDown && !prevSwitchDown;
+        prevSwitchDown = switchDown;
 
-        if (sw == Switch::Down) {
-            if (!recording) {
+        if (switchDown) {
+            if (switchJustPressed && !recording) {
                 // New recording: silence all voices and reset buffer
                 for (int i = 0; i < NUM_VOICES; i++) {
                     voices[i].active = false;
                     voices[i].state  = VS_IDLE;
                 }
-                writeHead = 0;
-                sampleLen = 0;
-                hasSample = false;
-                recording = true;
+                writeHead   = 0;
+                sampleLen   = 0;
+                hasSample   = false;
+                loopStartPt = 0;
+                recording   = true;
             }
             if (writeHead < BUFFER_SIZE) {
-                // 12-bit signed → 8-bit unsigned  (÷16, +128)
-                sampleBuffer[writeHead++] = (uint8_t)((AudioIn1() >> 4) + 128);
+                // Decimate to 24 kHz: write one sample every two output ticks
+                if (recordDecimate == 0)
+                    sampleBuffer[writeHead++] = codec.encodeSample(AudioIn1());
+                recordDecimate ^= 1;
             } else {
                 // Buffer full: finish recording
                 sampleLen = writeHead;
                 hasSample = true;
                 recording = false;
+                computeLoopStart();
             }
         } else {
             if (recording) {
@@ -297,6 +335,7 @@ public:
                 sampleLen = writeHead;
                 hasSample = (writeHead > 0);
                 recording = false;
+                if (hasSample) computeLoopStart();
             }
         }
 
@@ -309,7 +348,7 @@ public:
         int32_t mix = 0;
 
         if (len > 0) {
-            int loopStart = len >> 1;   // 50 % loop point
+            int loopStart = loopStartPt > 0 ? loopStartPt : len >> 1;
             int loopLen   = len - loopStart;
 
             // Runtime crossfade: is the loop long enough to support it?
@@ -341,13 +380,17 @@ public:
                 // so there is no discontinuity.
                 int16_t smp;
                 if (canXfade && pos >= xfZoneStart) {
-                    int xOff = pos - xfZoneStart;                    // 0 .. XFADE_LEN-1
-                    int t    = (xOff * 256) / XFADE_LEN;            // 0=all tail, 255=all head
-                    int s1   = (int)sampleBuffer[pos]               - 128;
-                    int s2   = (int)sampleBuffer[loopStart + xOff]  - 128;
-                    smp = (int16_t)((s1 + (((s2 - s1) * t) >> 8)) << 4);
+                    int xOff = pos - xfZoneStart;           // 0 .. XFADE_LEN-1
+                    int t    = (xOff * 256) / XFADE_LEN;   // 0..255 linear
+                    // Smoothstep: 3t² - 2t³  (avoids the level dip of a linear crossfade)
+                    int t2   = (t * t) >> 8;                // t² normalised to 0..255
+                    int t3   = (t2 * t) >> 8;               // t³ normalised to 0..255
+                    int ts   = 3 * t2 - 2 * t3;            // smoothstep, 0..256
+                    int s1   = codec.decodeSample(sampleBuffer[pos]);
+                    int s2   = codec.decodeSample(sampleBuffer[loopStart + xOff]);
+                    smp = (int16_t)(s1 + (((s2 - s1) * ts) >> 8));
                 } else {
-                    smp = ((int16_t)sampleBuffer[pos] - 128) << 4;
+                    smp = codec.decodeSample(sampleBuffer[pos]);
                 }
 
                 // ADSR envelope update
@@ -395,8 +438,8 @@ public:
                 mix += ((int32_t)smp * (int32_t)level) >> 16;
             }
 
-            // Divide by 4 (max voices) to keep within 12-bit range
-            mix >>= 2;
+            // Divide by 8 (next power of 2 above 6 voices) to stay in 12-bit range
+            mix >>= 3;
         }
 
         // Hard-clip to ±2047
@@ -404,22 +447,33 @@ public:
         if (mix < -2048) mix = -2048;
 
         AudioOut1((int16_t)mix);
-        AudioOut2((int16_t)mix);
+
+        // Audio Out 2: real-time codec monitor – encode then immediately decode
+        // Audio In 1 so you can hear exactly what µ-law compression sounds like.
+        AudioOut2(codec.decodeSample(codec.encodeSample(AudioIn1())));
 
         // --- LEDs ---
-        LedOn(4, recording);
-        LedOn(5, hasSample);
-        for (int i = 0; i < 4; i++) LedOn(i, voices[i].active);
+        // All 6 LEDs = voice activity.  During recording all voices are silenced
+        // so we light all LEDs to show recording is in progress.
+        if (recording) {
+            for (int i = 0; i < 6; i++) LedOn(i, true);
+        } else {
+            for (int i = 0; i < NUM_VOICES; i++) LedOn(i, voices[i].active);
+        }
     }
 
 private:
     bool         recording;
+    bool         prevSwitchDown;
     int          writeHead;
+    int          recordDecimate;  // toggles 0/1 to halve the recording sample rate
     volatile int presetIdx;
+    volatile int loopStartPt;     // upward zero-crossing near 50% of buffer
 };
 
 int main()
 {
+    set_sys_clock_khz(200000, true);   // 200 MHz – comfortable headroom for 6-voice processing
     VSS vss;
     vss.Run();
 }
