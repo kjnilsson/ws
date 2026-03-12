@@ -345,36 +345,55 @@ public:
         uint32_t dRate    = decayRateFn(p.decay_ms, swing);
         uint32_t rRate    = adsrRate(p.release_ms);
 
-        // Find a free voice, or steal the oldest one
-        int slot = -1;
-        uint32_t oldestAge  = 0;
-        int      oldest     = 0;
+        // Voice selection priority:
+        //   1. Any free (inactive / idle) voice          → envelope starts at 0
+        //   2. Same-note voice in release phase           → envelope starts from current level
+        //   3. Same-note voice in any other active state  → envelope starts at 0
+        //   4. Oldest active voice (voice steal)          → envelope starts from current
+        //      level if it happens to be in release, else 0
+        int freeSlot      = -1;
+        int sameReleasing = -1;
+        int sameActive    = -1;
+        uint32_t oldestAge = 0;
+        int      oldest    = 0;
 
         for (int i = 0; i < NUM_VOICES; i++) {
-            // Retrigger same note on same voice
-            if (voices[i].active && voices[i].note == note) { slot = i; break; }
             if (!voices[i].active || voices[i].state == VS_IDLE) {
-                if (slot < 0) slot = i;
-            } else if (voices[i].age > oldestAge) {
-                oldestAge = voices[i].age;
-                oldest    = i;
+                if (freeSlot < 0) freeSlot = i;
+                continue;
             }
+            if (voices[i].note == note) {
+                if (voices[i].state == VS_RELEASE) sameReleasing = i;
+                else                               sameActive    = i;
+            }
+            if (voices[i].age > oldestAge) { oldestAge = voices[i].age; oldest = i; }
         }
-        if (slot < 0) slot = oldest;
+
+        int  slot            = -1;
+        bool startFromCurrent = false;
+        if      (freeSlot      >= 0) { slot = freeSlot; }
+        else if (sameReleasing >= 0) { slot = sameReleasing; startFromCurrent = true; }
+        else if (sameActive    >= 0) { slot = sameActive; }
+        else {
+            slot = oldest;
+            startFromCurrent = (voices[slot].state == VS_RELEASE);
+        }
+
+        uint32_t startEnv = startFromCurrent ? voices[slot].envAccum : 0u;
 
         // Write all parameters first; set `active` last so the audio
         // core sees a fully-initialised voice when it picks it up.
-        voices[slot].note        = note;
-        voices[slot].phase       = 0;
-        voices[slot].step        = step;
+        voices[slot].note         = note;
+        voices[slot].phase        = 0;
+        voices[slot].step         = step;
         voices[slot].sustainAccum = susAccum;
-        voices[slot].attackRate  = aRate;
-        voices[slot].decayRate   = dRate;
-        voices[slot].releaseRate = rRate;
-        voices[slot].envAccum    = 0;
-        voices[slot].state       = VS_ATTACK;
-        voices[slot].age         = ++voiceAgeCtr;
-        voices[slot].active      = true;   // ← set last
+        voices[slot].attackRate   = aRate;
+        voices[slot].decayRate    = dRate;
+        voices[slot].releaseRate  = rRate;
+        voices[slot].envAccum     = startEnv;
+        voices[slot].state        = VS_ATTACK;
+        voices[slot].age          = ++voiceAgeCtr;
+        voices[slot].active       = true;   // ← set last
     }
 
     void noteOff(uint8_t note)
