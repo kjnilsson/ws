@@ -7,9 +7,9 @@ private:
     uint16_t writePos;
     uint16_t bufferSize;
 
-    // Clock simulation (48kHz / 12kHz = clock every 4 samples)
+    // Clock simulation (48kHz / 24kHz = clock every 2 samples)
     uint8_t clockCounter;
-    const uint8_t clockDivider = 4;
+    const uint8_t clockDivider = 2;
 
     // Filter state
     int8_t filterState;  // Changed to signed
@@ -72,8 +72,8 @@ private:
 
     // Linear interpolation between buffer positions
     inline int8_t interpolateRead(uint32_t delaySamplesFP) {
-        // Convert 48kHz samples to 12kHz stages
-        uint32_t delayStagesFP = delaySamplesFP >> 2;
+        // Convert 48kHz samples to 24kHz stages
+        uint32_t delayStagesFP = delaySamplesFP >> 1;
 
         // Extract integer and fractional parts
         uint32_t delayStages = delayStagesFP >> 16;

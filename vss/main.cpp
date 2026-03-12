@@ -15,6 +15,14 @@
 //   Left  (CCW) = short / plucky
 //   Right (CW)  = slow / sweepy
 //
+// Y KNOB:  Delay time (Audio Out 2 only).
+//   Left  (CCW) = ~50 ms (slapback)
+//   Right (CW)  = ~750 ms (long echo, ~5 repeats, darkening)
+//
+// OUTPUTS:
+//   Audio Out 1 = dry mix
+//   Audio Out 2 = reverb wet only
+//
 // LEDs:
 //   0-3  = voice 1-4 active
 //   4    = recording in progress
@@ -22,6 +30,7 @@
 
 #include "ComputerCard.h"
 #include "MuLawCodec.h"
+#include "Delay.h"
 #include "pico/multicore.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
@@ -31,6 +40,7 @@
 #include <string.h>
 
 static MuLawCodec codec;
+static Delay delay;
 
 // ===========================================================
 // ADSR PRESETS  –  Edit these freely to taste!
@@ -180,7 +190,8 @@ class VSS : public ComputerCard
 public:
     VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0),
             prevSwitchDown(false), prevSwitchUp(false),
-            loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false)
+            loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false),
+            pendingDelayCapture(false), delayKnobY(0)
     {
         loadFromFlash();                      // restore last sample before audio starts
         multicore_launch_core1(core1entry);
@@ -394,6 +405,7 @@ public:
         voices[slot].state        = VS_ATTACK;
         voices[slot].age          = ++voiceAgeCtr;
         voices[slot].active       = true;   // ← set last
+        pendingDelayCapture = true;
     }
 
     void noteOff(uint8_t note)
@@ -593,9 +605,12 @@ public:
 
         AudioOut1((int16_t)mix);
 
-        // Audio Out 2: real-time codec monitor – encode then immediately decode
-        // Audio In 1 so you can hear exactly what µ-law compression sounds like.
-        AudioOut2(codec.decodeSample(codec.encodeSample(AudioIn1())));
+        // Audio Out 2: delay wet only.  Y knob sampled on each note-on.
+        if (pendingDelayCapture) {
+            delayKnobY          = KnobVal(Knob::Y);
+            pendingDelayCapture = false;
+        }
+        AudioOut2(delay.process((int16_t)mix, delayKnobY));
 
         // --- LEDs ---
         // All 6 LEDs = voice activity.  During recording all voices are silenced
@@ -615,8 +630,10 @@ private:
     bool         isUSBMIDIHost;
     int          writeHead;
     int          recordDecimate;  // toggles 0/1 to halve the recording sample rate
-    volatile int presetIdx;
-    volatile int loopStartPt;     // upward zero-crossing near 50% of buffer
+    volatile int  presetIdx;
+    volatile int  loopStartPt;     // upward zero-crossing near 50% of buffer
+    volatile bool pendingDelayCapture;
+    int           delayKnobY;
 
 public:
     static uint8_t midi_dev_addr;
