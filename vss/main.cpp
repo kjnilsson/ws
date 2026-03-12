@@ -1,0 +1,425 @@
+// VSS - Yamaha VSS-30 inspired 8-bit sampler
+// for Music Thing Workshop System Computer
+//
+// RECORD  (hold Z switch DOWN):
+//   Samples Audio In 1 into an 8-bit mono buffer (~2 sec at 48 kHz).
+//   Stops when the buffer is full or the switch is released.
+//
+// PLAY  (USB MIDI, 4-voice polyphonic):
+//   Connect a USB MIDI keyboard or controller (device mode).
+//   Base pitch = MIDI note 60 (C4).  Playback loops with a fixed
+//   loop point at 50 % of the recorded length (sustain-loop style:
+//   the first pass plays the whole sample, then it loops the second half).
+//
+// X KNOB:  Selects an ADSR envelope preset.
+//   Left  (CCW) = short / plucky
+//   Right (CW)  = slow / sweepy
+//
+// LEDs:
+//   0-3  = voice 1-4 active
+//   4    = recording in progress
+//   5    = sample ready
+
+#include "ComputerCard.h"
+#include "pico/multicore.h"
+#include "tusb.h"
+#include <math.h>
+
+// ===========================================================
+// ADSR PRESETS  –  Edit these freely to taste!
+//
+//   attack_ms / decay_ms / release_ms  in milliseconds
+//   sustain   0 = silent  …  255 = full level
+// ===========================================================
+struct ADSRPreset {
+    const char* name;
+    uint32_t attack_ms;
+    uint32_t decay_ms;
+    uint8_t  sustain;       // 0-255
+    uint32_t release_ms;
+};
+
+static const ADSRPreset PRESETS[] = {
+//   Name             Att    Dec   Sus   Rel
+    { "Pluck",           5,    80,   0,    50 },
+    { "Clavinet",        2,    50,   0,    30 },
+    { "Marimba",         2,   200,   0,   100 },
+    { "Piano",           5,   500,  50,   300 },
+    { "Harpsichord",     2,   900,   0,   120 },
+    { "Organ",           5,     0, 255,    30 },
+    { "Strings",       150,   300, 210,   700 },
+    { "Pad",           500,   800, 225,  1100 },
+    { "Choir",         350,   500, 230,  1000 },
+    { "Slow Sweep",   1200,  2500, 210,  2500 },
+};
+
+static const int NUM_PRESETS = (int)(sizeof(PRESETS) / sizeof(PRESETS[0]));
+
+// ===========================================================
+// Sample buffer  –  8-bit unsigned, ~2 seconds at 48 kHz
+// ===========================================================
+static const uint32_t SAMPLE_RATE = 48000;
+static const int      BUFFER_SIZE = (int)(SAMPLE_RATE * 4);   // 192 000 bytes ≈ 188 KB
+
+// Loop crossfade length in samples (~5 ms at 48 kHz).
+// When pos enters the last XFADE_LEN samples before the loop end, we
+// simultaneously read from the corresponding position at the loop start and
+// linearly blend between them.  After the wrap we resume from
+// loopStart + XFADE_LEN, so the first post-wrap output sample is adjacent to
+// the last crossfade output sample — no discontinuity, no click.
+static const int XFADE_LEN = 256;
+
+static uint8_t sampleBuffer[BUFFER_SIZE];
+static volatile int  sampleLen  = 0;
+static volatile bool hasSample  = false;
+
+static const int BASE_NOTE = 60;   // MIDI C4 = 1 : 1 playback speed
+
+// ===========================================================
+// ADSR  –  Q8 fixed-point envelope
+//
+// envAccum  0 .. ENV_TOP  (= 65535 × 256 = 16 776 960)
+//   level = envAccum >> 8        (0 .. 65535, 16-bit)
+//   audio = (sample * level) >> 16   (12-bit output)
+//
+// Rates are in Q8 units / sample (256 = advance 1 level unit / sample).
+// This supports times from ~0.02 ms up to ~5 seconds accurately.
+// ===========================================================
+static const uint32_t ENV_TOP = 65535u * 256u;   // max envAccum value
+static const uint32_t ENV_MAX = 65535u;           // max level (= ENV_TOP >> 8)
+
+// Rate to sweep from 0 to ENV_MAX in `ms` milliseconds
+static uint32_t adsrRate(uint32_t ms)
+{
+    if (ms == 0) return ENV_TOP;          // instant
+    uint32_t samples = ms * SAMPLE_RATE / 1000u;
+    uint32_t rate    = ENV_TOP / samples;
+    return rate < 1u ? 1u : rate;
+}
+
+// Rate to decay over a partial swing (= ENV_MAX - sustainLevel) in `ms` ms
+static uint32_t decayRateFn(uint32_t ms, uint32_t swing)
+{
+    if (swing == 0) return ENV_TOP;       // nothing to decay  → instant
+    if (ms    == 0) return swing * 256u;  // instant
+    uint32_t samples = ms * SAMPLE_RATE / 1000u;
+    uint32_t rate    = (swing * 256u) / samples;
+    return rate < 1u ? 1u : rate;
+}
+
+// ===========================================================
+// Polyphonic voice
+// ===========================================================
+static const int NUM_VOICES = 4;
+
+enum VoiceState : uint8_t { VS_IDLE, VS_ATTACK, VS_DECAY, VS_SUSTAIN, VS_RELEASE };
+
+struct Voice {
+    volatile bool        active;
+    volatile uint8_t     note;
+    volatile uint32_t    phase;        // Q8 playback position (phase >> 8 = sample index)
+    volatile uint32_t    step;         // Q8 playback step per sample (256 = 1 sample/sample)
+    volatile uint32_t    envAccum;     // Q8 envelope accumulator  (0 .. ENV_TOP)
+    volatile uint32_t    attackRate;
+    volatile uint32_t    decayRate;
+    volatile uint32_t    sustainAccum; // sustainLevel × 256
+    volatile uint32_t    releaseRate;
+    volatile VoiceState  state;
+    volatile uint32_t    age;          // voice-stealing: larger = older
+
+    Voice()
+        : active(false), note(0), phase(0), step(256u),
+          envAccum(0), attackRate(1u), decayRate(1u),
+          sustainAccum(0), releaseRate(1u),
+          state(VS_IDLE), age(0) {}
+};
+
+static Voice   voices[NUM_VOICES];
+static volatile uint32_t voiceAgeCtr = 0;
+
+// ===========================================================
+// MIDI message parser
+// ===========================================================
+struct MIDIMsg {
+    enum Cmd { Unknown = 0, NoteOn = 0x90, NoteOff = 0x80 };
+    Cmd     cmd;
+    uint8_t note, vel;
+
+    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0) {
+        switch (p[0] & 0xF0) {
+        case 0x90: cmd = NoteOn;  note = p[1]; vel = p[2]; break;
+        case 0x80: cmd = NoteOff; note = p[1]; vel = p[2]; break;
+        default: break;
+        }
+    }
+};
+
+// ===========================================================
+// VSS card
+// ===========================================================
+class VSS : public ComputerCard
+{
+public:
+    VSS() : recording(false), writeHead(0), presetIdx(0)
+    {
+        multicore_launch_core1(core1entry);
+    }
+
+    // Boilerplate: call member function on core 1
+    static void core1entry() { static_cast<VSS*>(ThisPtr())->MIDICore(); }
+
+    // ---- MIDI core (core 1) ----------------------------------------
+
+    void MIDICore()
+    {
+        tusb_init();
+        uint8_t buf[64];
+
+        while (true) {
+            tud_task();
+            while (tud_midi_available()) {
+                uint32_t n = tud_midi_stream_read(buf, sizeof(buf));
+                uint8_t* p = buf;
+                while (n > 0) {
+                    MIDIMsg m(p);
+                    handleMIDI(m);
+                    // advance to next status byte
+                    do { ++p; --n; } while (n > 0 && !(*p & 0x80));
+                }
+            }
+        }
+    }
+
+    void handleMIDI(const MIDIMsg& m)
+    {
+        if (m.cmd == MIDIMsg::NoteOn && m.vel > 0)
+            noteOn(m.note);
+        else if (m.cmd == MIDIMsg::NoteOff ||
+                 (m.cmd == MIDIMsg::NoteOn && m.vel == 0))
+            noteOff(m.note);
+    }
+
+    void noteOn(uint8_t note)
+    {
+        int len = sampleLen;
+        if (len <= 0) return;
+
+        const ADSRPreset& p = PRESETS[presetIdx];
+
+        // Q8 playback step:  256 × 2^((note - 60) / 12)
+        float semis = (float)((int)note - BASE_NOTE);
+        uint32_t step = (uint32_t)(256.0f * powf(2.0f, semis / 12.0f));
+        if (step <    8u) step =    8u;    // floor ~  5 octaves below base
+        if (step > 8192u) step = 8192u;    // cap   ~  5 octaves above base
+
+        // ADSR parameters
+        uint32_t susLev   = (uint32_t)p.sustain * 257u;      // 0 .. 65535
+        uint32_t susAccum = susLev * 256u;                    // Q8 sustain target
+        uint32_t swing    = ENV_MAX - susLev;                 // decay swing
+        uint32_t aRate    = adsrRate(p.attack_ms);
+        uint32_t dRate    = decayRateFn(p.decay_ms, swing);
+        uint32_t rRate    = adsrRate(p.release_ms);
+
+        // Find a free voice, or steal the oldest one
+        int slot = -1;
+        uint32_t oldestAge  = 0;
+        int      oldest     = 0;
+
+        for (int i = 0; i < NUM_VOICES; i++) {
+            // Retrigger same note on same voice
+            if (voices[i].active && voices[i].note == note) { slot = i; break; }
+            if (!voices[i].active || voices[i].state == VS_IDLE) {
+                if (slot < 0) slot = i;
+            } else if (voices[i].age > oldestAge) {
+                oldestAge = voices[i].age;
+                oldest    = i;
+            }
+        }
+        if (slot < 0) slot = oldest;
+
+        // Write all parameters first; set `active` last so the audio
+        // core sees a fully-initialised voice when it picks it up.
+        voices[slot].note        = note;
+        voices[slot].phase       = 0;
+        voices[slot].step        = step;
+        voices[slot].sustainAccum = susAccum;
+        voices[slot].attackRate  = aRate;
+        voices[slot].decayRate   = dRate;
+        voices[slot].releaseRate = rRate;
+        voices[slot].envAccum    = 0;
+        voices[slot].state       = VS_ATTACK;
+        voices[slot].age         = ++voiceAgeCtr;
+        voices[slot].active      = true;   // ← set last
+    }
+
+    void noteOff(uint8_t note)
+    {
+        for (int i = 0; i < NUM_VOICES; i++) {
+            if (voices[i].active && voices[i].note == note &&
+                voices[i].state != VS_RELEASE && voices[i].state != VS_IDLE)
+            {
+                voices[i].state = VS_RELEASE;
+            }
+        }
+    }
+
+    // ---- Audio core (core 0) ----------------------------------------
+
+    virtual void ProcessSample() override
+    {
+        // --- Recording (Z switch Down = momentary press) ---
+        Switch sw = SwitchVal();
+
+        if (sw == Switch::Down) {
+            if (!recording) {
+                // New recording: silence all voices and reset buffer
+                for (int i = 0; i < NUM_VOICES; i++) {
+                    voices[i].active = false;
+                    voices[i].state  = VS_IDLE;
+                }
+                writeHead = 0;
+                sampleLen = 0;
+                hasSample = false;
+                recording = true;
+            }
+            if (writeHead < BUFFER_SIZE) {
+                // 12-bit signed → 8-bit unsigned  (÷16, +128)
+                sampleBuffer[writeHead++] = (uint8_t)((AudioIn1() >> 4) + 128);
+            } else {
+                // Buffer full: finish recording
+                sampleLen = writeHead;
+                hasSample = true;
+                recording = false;
+            }
+        } else {
+            if (recording) {
+                // Switch released: finish recording
+                sampleLen = writeHead;
+                hasSample = (writeHead > 0);
+                recording = false;
+            }
+        }
+
+        // --- Preset selection from X knob ---
+        presetIdx = (KnobVal(Knob::X) * NUM_PRESETS) >> 12;
+        if (presetIdx >= NUM_PRESETS) presetIdx = NUM_PRESETS - 1;
+
+        // --- Voice processing ---
+        int len = sampleLen;
+        int32_t mix = 0;
+
+        if (len > 0) {
+            int loopStart = len >> 1;   // 50 % loop point
+            int loopLen   = len - loopStart;
+
+            // Runtime crossfade: is the loop long enough to support it?
+            // Need loopLen > 2*XFADE_LEN so the crossfade head and tail don't overlap.
+            bool canXfade     = (loopLen > XFADE_LEN * 2);
+            int  xfZoneStart  = len - XFADE_LEN;   // pos where crossfade begins
+            // After wrap we jump here, past the region we just faded in
+            int  wrapTarget   = canXfade ? loopStart + XFADE_LEN : loopStart;
+            int  wrapLoopLen  = len - wrapTarget;
+
+            for (int i = 0; i < NUM_VOICES; i++) {
+                if (!voices[i].active) continue;
+
+                // Advance playback position (Q8)
+                voices[i].phase += voices[i].step;
+                int pos = (int)(voices[i].phase >> 8);
+
+                // Loop wrap: land at wrapTarget so we're past the faded-in head
+                if (pos >= len) {
+                    int over = pos - len;
+                    pos = (wrapLoopLen > 0) ? wrapTarget + (over % wrapLoopLen) : wrapTarget;
+                    voices[i].phase = (uint32_t)pos << 8;
+                }
+
+                // 8-bit unsigned → 12-bit signed sample, with runtime loop crossfade.
+                // When pos is in [xfZoneStart, len): simultaneously read from pos (tail,
+                // fading out) and loopStart+xOff (head, fading in).  After the wrap we
+                // resume at loopStart+XFADE_LEN, adjacent to the last faded-in sample,
+                // so there is no discontinuity.
+                int16_t smp;
+                if (canXfade && pos >= xfZoneStart) {
+                    int xOff = pos - xfZoneStart;                    // 0 .. XFADE_LEN-1
+                    int t    = (xOff * 256) / XFADE_LEN;            // 0=all tail, 255=all head
+                    int s1   = (int)sampleBuffer[pos]               - 128;
+                    int s2   = (int)sampleBuffer[loopStart + xOff]  - 128;
+                    smp = (int16_t)((s1 + (((s2 - s1) * t) >> 8)) << 4);
+                } else {
+                    smp = ((int16_t)sampleBuffer[pos] - 128) << 4;
+                }
+
+                // ADSR envelope update
+                switch (voices[i].state) {
+                case VS_ATTACK:
+                    voices[i].envAccum += voices[i].attackRate;
+                    if (voices[i].envAccum >= ENV_TOP) {
+                        voices[i].envAccum = ENV_TOP;
+                        voices[i].state    = VS_DECAY;
+                    }
+                    break;
+
+                case VS_DECAY:
+                    if (voices[i].envAccum > voices[i].sustainAccum &&
+                        voices[i].envAccum - voices[i].sustainAccum > voices[i].decayRate)
+                    {
+                        voices[i].envAccum -= voices[i].decayRate;
+                    } else {
+                        voices[i].envAccum = voices[i].sustainAccum;
+                        voices[i].state    = VS_SUSTAIN;
+                    }
+                    break;
+
+                case VS_SUSTAIN:
+                    voices[i].envAccum = voices[i].sustainAccum;
+                    break;
+
+                case VS_RELEASE:
+                    if (voices[i].envAccum > voices[i].releaseRate) {
+                        voices[i].envAccum -= voices[i].releaseRate;
+                    } else {
+                        voices[i].envAccum = 0;
+                        voices[i].active   = false;
+                        voices[i].state    = VS_IDLE;
+                    }
+                    break;
+
+                default:
+                    break;
+                }
+
+                // Apply envelope:  level = envAccum >> 8  (0-65535)
+                // Output = (12-bit sample × 16-bit level) >> 16  = 12-bit
+                uint32_t level = voices[i].envAccum >> 8;
+                mix += ((int32_t)smp * (int32_t)level) >> 16;
+            }
+
+            // Divide by 4 (max voices) to keep within 12-bit range
+            mix >>= 2;
+        }
+
+        // Hard-clip to ±2047
+        if (mix >  2047) mix =  2047;
+        if (mix < -2048) mix = -2048;
+
+        AudioOut1((int16_t)mix);
+        AudioOut2((int16_t)mix);
+
+        // --- LEDs ---
+        LedOn(4, recording);
+        LedOn(5, hasSample);
+        for (int i = 0; i < 4; i++) LedOn(i, voices[i].active);
+    }
+
+private:
+    bool         recording;
+    int          writeHead;
+    volatile int presetIdx;
+};
+
+int main()
+{
+    VSS vss;
+    vss.Run();
+}
