@@ -24,6 +24,7 @@
 #include "MuLawCodec.h"
 #include "pico/multicore.h"
 #include "tusb.h"
+#include "usb_midi_host.h"
 #include <math.h>
 
 static MuLawCodec codec;
@@ -166,7 +167,8 @@ struct MIDIMsg {
 class VSS : public ComputerCard
 {
 public:
-    VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0), prevSwitchDown(false), loopStartPt(0)
+    VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0),
+            prevSwitchDown(false), loopStartPt(0), isUSBMIDIHost(false)
     {
         multicore_launch_core1(core1entry);
     }
@@ -178,20 +180,53 @@ public:
 
     void MIDICore()
     {
-        tusb_init();
-        uint8_t buf[64];
+        // Wait for USB power state to settle, then detect host vs device
+        sleep_us(150000);
+        USBPowerState_t pwr = USBPowerState();
+        isUSBMIDIHost = (pwr == DFP);   // DFP = keyboard plugged in → we are host
+                                         // UFP / Unsupported → plugged into laptop → device
 
+        if (isUSBMIDIHost)
+            tuh_init(TUH_OPT_RHPORT);
+        else
+            tud_init(TUD_OPT_RHPORT);
+
+        uint8_t buf[64];
         while (true) {
-            tud_task();
-            while (tud_midi_available()) {
-                uint32_t n = tud_midi_stream_read(buf, sizeof(buf));
-                uint8_t* p = buf;
-                while (n > 0) {
-                    MIDIMsg m(p);
-                    handleMIDI(m);
-                    // advance to next status byte
-                    do { ++p; --n; } while (n > 0 && !(*p & 0x80));
+            if (isUSBMIDIHost) {
+                tuh_task();
+                // MIDI data arrives via tuh_midi_rx_cb callback below
+            } else {
+                tud_task();
+                while (tud_midi_available()) {
+                    uint32_t n = tud_midi_stream_read(buf, sizeof(buf));
+                    uint8_t* p = buf;
+                    while (n > 0) {
+                        MIDIMsg m(p);
+                        handleMIDI(m);
+                        do { ++p; --n; } while (n > 0 && !(*p & 0x80));
+                    }
                 }
+            }
+        }
+    }
+
+    // Called from tuh_midi_rx_cb (free function below) when in host mode
+    static void handleRx(uint8_t dev_addr, uint32_t num_packets)
+    {
+        if (midi_dev_addr == 0 || dev_addr != midi_dev_addr || num_packets == 0)
+            return;
+
+        uint8_t cable;
+        uint8_t buf[64];
+        while (true) {
+            uint32_t n = tuh_midi_stream_read(dev_addr, &cable, buf, sizeof(buf));
+            if (n == 0) return;
+            uint8_t* p = buf;
+            while (n > 0) {
+                MIDIMsg m(p);
+                static_cast<VSS*>(ThisPtr())->handleMIDI(m);
+                do { ++p; --n; } while (n > 0 && !(*p & 0x80));
             }
         }
     }
@@ -322,8 +357,8 @@ public:
                 if (recordDecimate == 0)
                     sampleBuffer[writeHead++] = codec.encodeSample(AudioIn1());
                 recordDecimate ^= 1;
-            } else {
-                // Buffer full: finish recording
+            } else if (recording) {
+                // Buffer full: finish recording (guard prevents re-entry each tick)
                 sampleLen = writeHead;
                 hasSample = true;
                 recording = false;
@@ -465,11 +500,49 @@ public:
 private:
     bool         recording;
     bool         prevSwitchDown;
+    bool         isUSBMIDIHost;
     int          writeHead;
     int          recordDecimate;  // toggles 0/1 to halve the recording sample rate
     volatile int presetIdx;
     volatile int loopStartPt;     // upward zero-crossing near 50% of buffer
+
+public:
+    static uint8_t midi_dev_addr;
+    static uint8_t device_connected;
 };
+
+uint8_t VSS::midi_dev_addr    = 0;
+uint8_t VSS::device_connected = 0;
+
+// ---- TinyUSB MIDI host callbacks (required by usb_midi_host driver) --------
+
+void tuh_midi_mount_cb(uint8_t dev_addr, uint8_t in_ep, uint8_t out_ep,
+                       uint8_t num_cables_rx, uint16_t num_cables_tx)
+{
+    (void)in_ep; (void)out_ep; (void)num_cables_rx; (void)num_cables_tx;
+    if (VSS::midi_dev_addr == 0) {
+        VSS::midi_dev_addr    = dev_addr;
+        VSS::device_connected = 1;
+    }
+}
+
+void tuh_midi_umount_cb(uint8_t dev_addr, uint8_t instance)
+{
+    (void)instance;
+    if (dev_addr == VSS::midi_dev_addr) {
+        VSS::midi_dev_addr    = 0;
+        VSS::device_connected = 0;
+    }
+}
+
+void tuh_midi_rx_cb(uint8_t dev_addr, uint32_t num_packets)
+{
+    VSS::handleRx(dev_addr, num_packets);
+}
+
+void tuh_midi_tx_cb(uint8_t dev_addr) { (void)dev_addr; }
+
+// ----------------------------------------------------------------------------
 
 int main()
 {

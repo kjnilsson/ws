@@ -1,5 +1,5 @@
 /*
- * TinyUSB configuration for VSS – USB MIDI device mode
+ * TinyUSB configuration for VSS – auto-detect host or device mode
  */
 
 #ifndef _TUSB_CONFIG_H_
@@ -13,21 +13,7 @@ extern "C" {
   #error CFG_TUSB_MCU must be defined
 #endif
 
-#ifndef BOARD_DEVICE_RHPORT_NUM
-  #define BOARD_DEVICE_RHPORT_NUM     0
-#endif
-
-#ifndef BOARD_DEVICE_RHPORT_SPEED
-  #define BOARD_DEVICE_RHPORT_SPEED   OPT_MODE_FULL_SPEED
-#endif
-
-#if BOARD_DEVICE_RHPORT_NUM == 0
-  #define CFG_TUSB_RHPORT0_MODE     (OPT_MODE_DEVICE | BOARD_DEVICE_RHPORT_SPEED)
-#elif BOARD_DEVICE_RHPORT_NUM == 1
-  #define CFG_TUSB_RHPORT1_MODE     (OPT_MODE_DEVICE | BOARD_DEVICE_RHPORT_SPEED)
-#else
-  #error "Incorrect RHPort configuration"
-#endif
+#define CFG_TUSB_RHPORT0_MODE       OPT_MODE_HOST | OPT_MODE_DEVICE
 
 #ifndef CFG_TUSB_OS
   #define CFG_TUSB_OS               OPT_OS_NONE
@@ -41,6 +27,8 @@ extern "C" {
   #define CFG_TUSB_MEM_ALIGN        __attribute__ ((aligned(4)))
 #endif
 
+// ---- Device mode (UFP: plugged into a laptop/DAW) --------------------------
+
 #ifndef CFG_TUD_ENDPOINT0_SIZE
   #define CFG_TUD_ENDPOINT0_SIZE    64
 #endif
@@ -51,8 +39,23 @@ extern "C" {
 #define CFG_TUD_MIDI              1
 #define CFG_TUD_VENDOR            0
 
-#define CFG_TUD_MIDI_RX_BUFSIZE   64
-#define CFG_TUD_MIDI_TX_BUFSIZE   64
+#define CFG_TUD_MIDI_RX_BUFSIZE   (TUD_OPT_HIGH_SPEED ? 512 : 64)
+#define CFG_TUD_MIDI_TX_BUFSIZE   (TUD_OPT_HIGH_SPEED ? 512 : 64)
+
+// ---- Host mode (DFP: keyboard plugged into the Computer) -------------------
+
+#define CFG_TUH_ENUMERATION_BUFSIZE 256
+
+#define CFG_TUH_HUB                 1
+#define CFG_TUH_CDC                 0
+#define CFG_TUH_HID                 0
+// NOTE: do NOT define CFG_TUH_MIDI 1 – use the rppicomidi app driver instead
+#define CFG_TUH_MSC                 1
+#define CFG_TUH_VENDOR              0
+
+#define CFG_TUH_DEVICE_MAX          (CFG_TUH_HUB ? 4 : 1)
+
+#define CFG_MIDI_HOST_DEVSTRINGS    1
 
 #ifdef __cplusplus
 }
