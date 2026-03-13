@@ -39,6 +39,7 @@
 #include <math.h>
 #include <string.h>
 
+
 static MuLawCodec codec;
 static Delay delay;
 
@@ -95,7 +96,7 @@ static const int XFADE_LEN = 1024;
 static const uint32_t FLASH_DATA_SECTORS = ((uint32_t)BUFFER_SIZE + FLASH_SECTOR_SIZE - 1u) / FLASH_SECTOR_SIZE;  // 36
 static const uint32_t FLASH_DATA_OFFSET  = PICO_FLASH_SIZE_BYTES - (FLASH_DATA_SECTORS + 1u) * FLASH_SECTOR_SIZE;
 static const uint32_t FLASH_META_OFFSET  = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
-static const uint32_t FLASH_MAGIC        = 0x56535301u;  // 'V','S','S', version 1
+static const uint32_t FLASH_MAGIC        = 0x56535302u;  // 'V','S','S', version 2 (+ XOR field)
 
 static uint8_t sampleBuffer[BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile int  sampleLen  = 0;
@@ -189,12 +190,13 @@ class VSS : public ComputerCard
 {
 public:
     VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0),
-            prevSwitchDown(false), prevSwitchUp(false),
+            prevSwitchDown(true), prevSwitchUp(false),
             loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false),
-            pendingDelayCapture(false), delayKnobY(0)
+            pendingDelayCapture(false), delayKnobY(0),
+            pendingCVNoteOn(false), pendingCVNote(0), gateState(false),
+            flashPending(false)
     {
         loadFromFlash();                      // restore last sample before audio starts
-        multicore_launch_core1(core1entry);
     }
 
     // ---- Flash load/save -----------------------------------------------
@@ -202,6 +204,7 @@ public:
     void loadFromFlash()
     {
         const uint8_t* meta = (const uint8_t*)(XIP_BASE + FLASH_META_OFFSET);
+
         uint32_t magic; memcpy(&magic, meta, 4);
         if (magic != FLASH_MAGIC) return;
 
@@ -211,6 +214,13 @@ public:
         if (len <= 0 || len > BUFFER_SIZE) return;
 
         memcpy(sampleBuffer, (const uint8_t*)(XIP_BASE + FLASH_DATA_OFFSET), (size_t)len);
+
+        uint8_t storedXor = 0;
+        memcpy(&storedXor, meta + 12, 1);
+        uint8_t computedXor = 0;
+        for (int32_t i = 0; i < len; i++) computedXor ^= sampleBuffer[i];
+        if (computedXor != storedXor) return;   // data corrupted
+
         sampleLen    = len;
         loopStartPt  = lsp;
         hasSample    = true;
@@ -220,23 +230,40 @@ public:
     void saveToFlash()
     {
         int len = sampleLen;
-        if (len <= 0 || !hasSample) return;
 
-        // Signal "saving" with all LEDs on
-        for (int i = 0; i < 6; i++) LedOn(i, true);
+        // Pause core 1 FIRST so we own the LEDs cleanly for all diagnostics.
+        // Core 1 called multicore_lockout_victim_init() and will park within ~21 µs.
+        multicore_lockout_start_blocking();
 
-        // Prepare metadata page (before entering the critical section so
-        // we don't call memcpy/memset while flash XIP is unavailable)
+        // 5 rapid blinks = saveToFlash entered (ProcessSample paused, clean visuals).
+        for (int b = 0; b < 5; b++) {
+            for (int i = 0; i < 6; i++) LedOn(i, true);  sleep_ms(200);
+            for (int i = 0; i < 6; i++) LedOn(i, false); sleep_ms(200);
+        }
+
+        if (len <= 0 || !hasSample) {
+            // 3 slow blinks = entered but nothing to save (len/hasSample invalid)
+            for (int b = 0; b < 3; b++) {
+                LedOn(0, true); sleep_ms(500); LedOn(0, false); sleep_ms(500);
+            }
+            multicore_lockout_end_blocking();
+            flashPending = false;
+            return;
+        }
+
+        // Prepare pages before disabling interrupts (memcpy/memset are safe here).
         static uint8_t metaPage[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
         memset(metaPage, 0, FLASH_PAGE_SIZE);
         uint32_t magic = FLASH_MAGIC;
         int32_t  iLen  = (int32_t)len;
         int32_t  iLsp  = (int32_t)loopStartPt;
-        memcpy(metaPage,     &magic, 4);
-        memcpy(metaPage + 4, &iLen,  4);
-        memcpy(metaPage + 8, &iLsp,  4);
+        uint8_t  xorChk = 0;
+        for (int i = 0; i < len; i++) xorChk ^= sampleBuffer[i];
+        memcpy(metaPage,      &magic,  4);
+        memcpy(metaPage + 4,  &iLen,   4);
+        memcpy(metaPage + 8,  &iLsp,   4);
+        memcpy(metaPage + 12, &xorChk, 1);
 
-        // Prepare last partial page (sampleBuffer may not fill an exact page multiple)
         static uint8_t lastPage[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
         uint32_t fullBytes = ((uint32_t)len / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
         uint32_t remaining = (uint32_t)len - fullBytes;
@@ -244,36 +271,85 @@ public:
             memset(lastPage, 0, FLASH_PAGE_SIZE);
             memcpy(lastPage, sampleBuffer + fullBytes, remaining);
         }
+        sleep_ms(500);
+        // All 6 LEDs = about to write flash
+        for (int i = 0; i < 6; i++) LedOn(i, true);
 
-        // Critical section: disable all IRQs and park core 1 while we write
         uint32_t ints = save_and_disable_interrupts();
-        multicore_lockout_start_blocking();
 
         flash_range_erase(FLASH_DATA_OFFSET, (FLASH_DATA_SECTORS + 1u) * FLASH_SECTOR_SIZE);
+        LedOn(5, false); // 5 LEDs = erase done, programming data
 
         if (fullBytes > 0)
             flash_range_program(FLASH_DATA_OFFSET, sampleBuffer, fullBytes);
         if (remaining > 0)
             flash_range_program(FLASH_DATA_OFFSET + fullBytes, lastPage, FLASH_PAGE_SIZE);
+        LedOn(4, false); // 4 LEDs = data written, programming metadata
 
         flash_range_program(FLASH_META_OFFSET, metaPage, FLASH_PAGE_SIZE);
+        LedOn(3, false); // 3 LEDs = metadata written
 
-        multicore_lockout_end_blocking();
         restore_interrupts(ints);
+        // Core 1 still paused — verify and display result while we own the LEDs.
 
-        savedToFlash = true;
+        const uint8_t* fmeta = (const uint8_t*)(XIP_BASE + FLASH_META_OFFSET);
+        const uint8_t* fdata = (const uint8_t*)(XIP_BASE + FLASH_DATA_OFFSET);
+
+        // Verify magic
+        uint32_t flash_magic_r = 0;
+        memcpy(&flash_magic_r, fmeta, 4);
+        bool magicOk = (flash_magic_r == FLASH_MAGIC);
+
+        // Verify len stored in meta
+        int32_t flash_len_r = 0;
+        memcpy(&flash_len_r, fmeta + 4, 4);
+        bool lenOk = (flash_len_r == (int32_t)len);
+
+        // Verify loopStartPt stored in meta
+        int32_t flash_lsp_r = 0;
+        memcpy(&flash_lsp_r, fmeta + 8, 4);
+        bool lspOk = (flash_lsp_r == (int32_t)loopStartPt);
+
+        // Full-buffer XOR checksum: catches any data corruption, no false positives
+        // from silence (0xFF matches erased flash) unlike spot checks.
+        uint8_t sram_xor = 0, flash_xor = 0;
+        for (int i = 0; i < len; i++) {
+            sram_xor  ^= sampleBuffer[i];
+            flash_xor ^= fdata[i];
+        }
+        bool xorOk = (sram_xor == flash_xor);
+
+        // 4 blinks (ProcessSample still paused):
+        //   LED 5 = magic   LED 4 = len   LED 3 = loopStart   LED 2 = full XOR
+        //   LEDs 1,0 off (spare)
+        for (int b = 0; b < 4; b++) {
+            LedOn(5, magicOk); LedOn(4, lenOk); LedOn(3, lspOk); LedOn(2, xorOk);
+            LedOn(1, false); LedOn(0, false);
+            sleep_ms(600);
+            for (int i = 0; i < 6; i++) LedOn(i, false);
+            sleep_ms(200);
+        }
+
+        bool ok = magicOk && lenOk && lspOk && xorOk;
+        multicore_lockout_end_blocking();
+        flashPending = false;
+        savedToFlash = ok;
     }
 
-    // Boilerplate: call member function on core 1
-    static void core1entry() { static_cast<VSS*>(ThisPtr())->MIDICore(); }
+    // Core 1 entry: audio processing.  Must call victim_init so core 0 can
+    // pause us safely during flash writes.
+    // Uses s_instance instead of ThisPtr() because thisptr isn't set until
+    // Run() itself is entered — calling ThisPtr() before Run() returns null.
+    static void audioEntry()
+    {
+        multicore_lockout_victim_init();
+        s_instance->Run();   // Run() sets ComputerCard::thisptr as its first act
+    }
 
-    // ---- MIDI core (core 1) ----------------------------------------
+    // ---- MIDI core (core 0 main thread) ----------------------------------------
 
     void MIDICore()
     {
-        // Must be called before core 0 can use multicore_lockout_start_blocking()
-        multicore_lockout_victim_init();
-
         // Wait for USB power state to settle, then detect host vs device
         sleep_us(150000);
         USBPowerState_t pwr = USBPowerState();
@@ -287,6 +363,13 @@ public:
 
         uint8_t buf[64];
         while (true) {
+            // Core 0 may request a flash write; park here (in RAM) until done.
+            // ProcessSample() (on core 1) sets this flag when the user requests save.
+            // We do the actual flash write here on core 0's main thread, where
+            // multicore_lockout_start_blocking() is safe to call.
+            if (flashPending)
+                saveToFlash();
+
             if (isUSBMIDIHost) {
                 tuh_task();
                 // MIDI data arrives via tuh_midi_rx_cb callback below
@@ -406,6 +489,19 @@ public:
         voices[slot].age          = ++voiceAgeCtr;
         voices[slot].active       = true;   // ← set last
         pendingDelayCapture = true;
+
+        // CV/gate: trigger only if this note is the lowest currently held
+        uint8_t lowest = 127;
+        for (int i = 0; i < NUM_VOICES; i++) {
+            if (voices[i].active &&
+                voices[i].state != VS_RELEASE && voices[i].state != VS_IDLE &&
+                voices[i].note < lowest)
+                lowest = voices[i].note;
+        }
+        if (note <= lowest) {
+            pendingCVNote   = note;
+            pendingCVNoteOn = true;
+        }
     }
 
     void noteOff(uint8_t note)
@@ -417,6 +513,7 @@ public:
                 voices[i].state = VS_RELEASE;
             }
         }
+
     }
 
     // Find the nearest upward zero crossing to sampleLen/2 and store it in
@@ -494,7 +591,7 @@ public:
         bool switchJustUp = switchUp && !prevSwitchUp;
         prevSwitchUp = switchUp;
         if (switchJustUp && hasSample && !savedToFlash)
-            saveToFlash();   // blocks ~1 s; audio glitch is expected and acceptable
+            flashPending = true;   // core 0 USB loop will call saveToFlash()
 
         // --- Preset selection from X knob ---
         presetIdx = (KnobVal(Knob::X) * NUM_PRESETS) >> 12;
@@ -605,6 +702,22 @@ public:
 
         AudioOut1((int16_t)mix);
 
+        // CV Out 1 / Gate Out 1:
+        //   - CV updates only on note-on, set to the lowest held note at that moment
+        //   - Gate goes high on that same note-on, stays high until all voices
+        //     have fully finished their release envelopes, then goes low and waits
+        //     for the next note-on.  Note-offs never change CV or cause retriggering.
+        if (pendingCVNoteOn) {
+            CVOut1MIDINote(pendingCVNote);
+            if (!gateState) { PulseOut1(true);  gateState = true; }
+            pendingCVNoteOn = false;
+        } else if (gateState) {
+            bool anyActive = false;
+            for (int i = 0; i < NUM_VOICES; i++)
+                if (voices[i].active) { anyActive = true; break; }
+            if (!anyActive) { PulseOut1(false); gateState = false; }
+        }
+
         // Audio Out 2: delay wet only.  Y knob sampled on each note-on.
         if (pendingDelayCapture) {
             delayKnobY          = KnobVal(Knob::Y);
@@ -615,14 +728,20 @@ public:
         // --- LEDs ---
         // All 6 LEDs = voice activity.  During recording all voices are silenced
         // so we light all LEDs to show recording is in progress.
+        static uint32_t sampleCount = 0;
+        ++sampleCount;
+
         if (recording) {
             for (int i = 0; i < 6; i++) LedOn(i, true);
         } else {
             for (int i = 0; i < NUM_VOICES; i++) LedOn(i, voices[i].active);
+            if (flashPending) LedOn(5, (sampleCount >> 12) & 1u);  // blink while save pending
         }
     }
 
 private:
+    volatile bool flashPending;   // set by core1 ProcessSample; serviced by core0 MIDICore
+
     bool         recording;
     bool         prevSwitchDown;
     bool         prevSwitchUp;
@@ -632,16 +751,21 @@ private:
     int          recordDecimate;  // toggles 0/1 to halve the recording sample rate
     volatile int  presetIdx;
     volatile int  loopStartPt;     // upward zero-crossing near 50% of buffer
-    volatile bool pendingDelayCapture;
-    int           delayKnobY;
+    volatile bool    pendingDelayCapture;
+    int              delayKnobY;
+    volatile bool    pendingCVNoteOn;
+    volatile uint8_t pendingCVNote;
+    bool             gateState;        // last value written to PulseOut1
 
 public:
     static uint8_t midi_dev_addr;
     static uint8_t device_connected;
+    static VSS*    s_instance;   // set by main() before multicore_launch_core1
 };
 
 uint8_t VSS::midi_dev_addr    = 0;
 uint8_t VSS::device_connected = 0;
+VSS*    VSS::s_instance       = nullptr;
 
 // ---- TinyUSB MIDI host callbacks (required by usb_midi_host driver) --------
 
@@ -677,5 +801,10 @@ int main()
 {
     set_sys_clock_khz(200000, true);   // 200 MHz – comfortable headroom for 6-voice processing
     VSS vss;
-    vss.Run();
+    VSS::s_instance = &vss;   // audioEntry() needs this before Run() sets thisptr
+    // Audio on core 1 (lockout victim); USB + flash save on core 0 (main thread).
+    // This matches the reverb card architecture: flash ops happen from the non-ISR
+    // core so multicore_lockout_start_blocking() is safe to call.
+    multicore_launch_core1(VSS::audioEntry);
+    vss.MIDICore();   // USB loop runs here on core 0; never returns
 }
