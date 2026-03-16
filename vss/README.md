@@ -30,7 +30,7 @@ Flip the **Z switch up** after recording. The module saves the sample to flash a
 
 All four LEDs lit = save verified. The sample will be restored on the next power-on.
 
-LED 5 blinks slowly while a save is in progress.
+The selected bank LED blinks slowly while a save is pending.
 
 ## Playback
 
@@ -50,6 +50,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 | Y knob    | Delay time, sampled on each note-on — slapback (~50 ms) to long echo (~750 ms) |
 | Z switch down | Record |
 | Z switch up   | Save to current bank |
+| Gate In 2 | Arpeggiator clock (rising edge advances step) |
 
 ## Outputs
 
@@ -59,6 +60,8 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 | Audio Out 2 | Tape-style echo (wet only) |
 | CV Out 1    | Lowest held MIDI note as 1V/oct |
 | Gate Out 1  | High while any voice is active |
+| CV Out 2    | Arpeggiator pitch (1V/oct) |
+| Gate Out 2  | Arpeggiator gate (~50 ms pulse per step) |
 
 ## Envelope presets (Main knob, left to right)
 
@@ -74,6 +77,14 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 | 8 | Pad | Very slow attack, long release |
 | 9 | Choir | Slow swell, breathy sustain |
 | 10 | Slow Sweep | Very slow attack and release |
+
+## Arpeggiator (CV Out 2 / Gate Out 2)
+
+The arpeggiator cycles upward through all currently held MIDI notes, outputting each as a 1V/oct pitch on CV Out 2 with a ~50 ms gate pulse on Gate Out 2.
+
+**Clock source** — plug a clock or gate signal into Gate In 2 and the arpeggiator steps on each rising edge. If nothing is connected, it steps automatically in time with the Y-knob delay period (so the arp and echo are naturally in sync).
+
+The arpeggiator resets to the first note whenever all notes are released.
 
 ## Delay (Audio Out 2)
 

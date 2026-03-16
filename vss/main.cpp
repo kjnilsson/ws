@@ -201,7 +201,8 @@ public:
             loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false),
             pendingDelayCapture(false), delayKnobY(0),
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false),
-            flashPending(false), bankIdx(0), pendingBank(0)
+            flashPending(false), bankIdx(0), pendingBank(0),
+            arpIdx(-1), arpGateTimer(0), arpIntTimer(0)
     {
     }
 
@@ -758,6 +759,46 @@ public:
         }
         AudioOut2(delay.process((int16_t)mix, delayKnobY));
 
+        // --- Arpeggiator (CV Out 2 / Gate Out 2) ---
+        // Collect held notes (active, non-releasing) into a sorted list
+        uint8_t arpNotes[NUM_VOICES];
+        int     arpCount = 0;
+        for (int i = 0; i < NUM_VOICES; i++) {
+            if (!voices[i].active ||
+                voices[i].state == VS_RELEASE ||
+                voices[i].state == VS_IDLE) continue;
+            uint8_t n = voices[i].note;
+            int j = arpCount;
+            while (j > 0 && arpNotes[j-1] > n) { arpNotes[j] = arpNotes[j-1]; --j; }
+            arpNotes[j] = n;
+            ++arpCount;
+        }
+
+        if (arpCount == 0) {
+            arpIdx = -1;
+        } else if (arpIdx >= arpCount) {
+            arpIdx %= arpCount;
+        }
+
+        // Clock: external rising edge on Pulse In 2 if connected, else delay-synced
+        bool arpTick = false;
+        if (Connected(Input::Pulse2)) {
+            arpTick    = PulseIn2RisingEdge();
+            arpIntTimer = 0;
+        } else {
+            int period = 2400 + ((int32_t)KnobVal(Knob::Y) * 33600) / 4096;
+            if (++arpIntTimer >= period) { arpIntTimer = 0; arpTick = true; }
+        }
+
+        if (arpTick && arpCount > 0) {
+            arpIdx = (arpIdx + 1) % arpCount;
+            CVOut2MIDINote(arpNotes[arpIdx]);
+            PulseOut2(true);
+            arpGateTimer = ARP_GATE_LEN;
+        }
+        if (arpGateTimer > 0 && --arpGateTimer == 0) PulseOut2(false);
+        if (arpCount == 0)                           PulseOut2(false);
+
         // --- LEDs ---
         // All 6 LEDs = voice activity.  During recording all voices are silenced
         // so we light all LEDs to show recording is in progress.
@@ -800,6 +841,12 @@ private:
     volatile bool    pendingCVNoteOn;
     volatile uint8_t pendingCVNote;
     bool             gateState;
+
+    // Arpeggiator
+    int  arpIdx;        // current note index (-1 = reset)
+    int  arpGateTimer;  // samples until Gate Out 2 goes low
+    int  arpIntTimer;   // internal delay-synced tick counter
+    static constexpr int ARP_GATE_LEN = 2400;  // 50 ms gate pulse
 
 public:
     static uint8_t midi_dev_addr;
