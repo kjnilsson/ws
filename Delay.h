@@ -6,7 +6,7 @@
 
 // Tape-style mono delay with LP-filtered feedback and interpolated time changes.
 //
-// Y knob (0-4095): delay time 50 ms → 750 ms
+// Y knob (0-4095): delay time 50 ms → 1000 ms
 // Feedback fixed at 0.65 (~5 audible repeats, each progressively darker).
 //
 // Input is scaled by INPUT_GAIN (-6 dB) before entering the feedback loop so
@@ -18,6 +18,8 @@
 // samples gives a smooth pitch-bend rather than a click during the transition.
 //
 // Delay buffer RAM: 36 000 × int16 = 72 KB
+// (Delay is limited to 750 ms to keep total static RAM within bounds:
+//  144 KB sample buffer + 72 KB delay = 216 KB, leaving room for the USB host stack.)
 
 class Delay {
     static constexpr int MAX_SAMPLES = 36000;   // 750 ms at 48 kHz
@@ -29,8 +31,7 @@ class Delay {
 
     static constexpr int32_t FEEDBACK   = 21299;  // 0.65 in Q15
     static constexpr int32_t LP_COEF    = 13107;  // 0.40 in Q15
-    /* static constexpr int32_t INPUT_GAIN = 16384;  // 0.50 in Q15 (-6 dB) */
-    static constexpr int32_t INPUT_GAIN = 10000;  // 0.50 in Q15 (-6 dB)
+    static constexpr int32_t INPUT_GAIN = 16384;  // 0.50 in Q15 (-6 dB)
     // Slew: 512 Q8-units/sample = 2 samples/sample → ~350 ms to sweep full range.
     static constexpr int32_t SLEW_Q8  = 512;
 

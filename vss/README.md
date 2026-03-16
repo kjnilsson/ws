@@ -4,6 +4,13 @@ A 6-voice polyphonic sampler inspired by the Yamaha VSS-30, for the Music Thing 
 
 Audio is recorded and stored at 24 kHz using µ-law compression (8 bits/sample), giving up to 6 seconds of mono sample time. The sample survives power-off — it is saved to flash and restored automatically on boot.
 
+## Sample banks
+
+VSS stores up to 6 independent samples in flash (banks 0–5). The X knob selects the active bank, shown as a dimly lit LED (LEDs 0–5 = banks 0–5).
+
+- **Loading**: the bank selected by the X knob is loaded automatically on power-on. Set the knob before powering up.
+- **Saving**: flip Z switch up after recording to save to the current bank. Banks are independent — saving to one does not affect the others.
+
 ## Recording
 
 Hold the **Z switch down**. All six LEDs light to confirm recording is in progress. Release the switch (or wait for the buffer to fill) to stop. The sample is ready to play immediately.
@@ -38,10 +45,11 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 
 | Control | Function |
 |---------|----------|
-| X knob  | ADSR envelope preset (see table below) |
-| Y knob  | Delay time, sampled on each note-on — turn for slapback to long echo |
+| Main knob | ADSR envelope preset (see table below) |
+| X knob    | Sample bank select (0–5, shown as dimly lit LED) |
+| Y knob    | Delay time, sampled on each note-on — slapback (~50 ms) to long echo (~750 ms) |
 | Z switch down | Record |
-| Z switch up   | Save to flash |
+| Z switch up   | Save to current bank |
 
 ## Outputs
 
@@ -52,7 +60,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 | CV Out 1    | Lowest held MIDI note as 1V/oct |
 | Gate Out 1  | High while any voice is active |
 
-## Envelope presets (X knob, left to right)
+## Envelope presets (Main knob, left to right)
 
 | Position | Name | Character |
 |----------|------|-----------|
@@ -69,7 +77,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 
 ## Delay (Audio Out 2)
 
-The echo on Audio Out 2 is a tape-style mono delay with low-pass filtered feedback, giving progressively darker repeats (~5 audible echoes). The Y knob sets the delay time at the moment each note is struck — notes played with different Y positions will have different echo times.
+The echo on Audio Out 2 is a tape-style mono delay with low-pass filtered feedback, giving progressively darker repeats (~5 audible echoes). The Y knob sets the delay time at the moment each note is struck (~50 ms to ~750 ms) — notes played with different Y positions will have different echo times.
 
 Mix Audio Out 1 (dry) and Audio Out 2 (wet) externally to taste.
 
@@ -79,4 +87,5 @@ Mix Audio Out 1 (dry) and Audio Out 2 (wet) externally to taste.
 |-----|---------|
 | 0–5 | Voice activity (one per voice) |
 | 0–5 all lit | Recording in progress |
-| 5 blinking  | Save pending |
+| One LED dimly lit | Selected sample bank (X knob position) |
+| Dimly lit LED blinking | Save pending |

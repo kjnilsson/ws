@@ -90,13 +90,20 @@ static const int      BUFFER_SIZE = RECORD_RATE * 6;          // 144 000 bytes �
 // the last crossfade output sample — no discontinuity, no click.
 static const int XFADE_LEN = 1024;
 
-// Flash storage layout (end of 2 MB flash):
-//   last sector           = metadata  (magic, sampleLen, loopStartPt)
-//   preceding 36 sectors  = sample data  (36 × 4096 = 147456 bytes ≥ BUFFER_SIZE)
+// Flash storage layout (end of 2 MB flash), 6 banks stacked from the end:
+//   each bank = 36 data sectors + 1 meta sector = 37 sectors = 148 KB
+//   bank 0 is closest to end of flash (same location as the original single-bank layout)
 static const uint32_t FLASH_DATA_SECTORS = ((uint32_t)BUFFER_SIZE + FLASH_SECTOR_SIZE - 1u) / FLASH_SECTOR_SIZE;  // 36
-static const uint32_t FLASH_DATA_OFFSET  = PICO_FLASH_SIZE_BYTES - (FLASH_DATA_SECTORS + 1u) * FLASH_SECTOR_SIZE;
-static const uint32_t FLASH_META_OFFSET  = PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE;
+static const uint32_t FLASH_BANK_SECTORS = FLASH_DATA_SECTORS + 1u;   // 37 per bank
+static const int      FLASH_NUM_BANKS    = 6;
 static const uint32_t FLASH_MAGIC        = 0x56535302u;  // 'V','S','S', version 2 (+ XOR field)
+
+static uint32_t flashDataOffset(int bank) {
+    return PICO_FLASH_SIZE_BYTES - (uint32_t)(bank + 1) * FLASH_BANK_SECTORS * FLASH_SECTOR_SIZE;
+}
+static uint32_t flashMetaOffset(int bank) {
+    return flashDataOffset(bank) + FLASH_DATA_SECTORS * FLASH_SECTOR_SIZE;
+}
 
 static uint8_t sampleBuffer[BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile int  sampleLen  = 0;
@@ -194,16 +201,15 @@ public:
             loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false),
             pendingDelayCapture(false), delayKnobY(0),
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false),
-            flashPending(false)
+            flashPending(false), bankIdx(0), pendingBank(0)
     {
-        loadFromFlash();                      // restore last sample before audio starts
     }
 
     // ---- Flash load/save -----------------------------------------------
 
-    void loadFromFlash()
+    void loadFromFlash(int bank)
     {
-        const uint8_t* meta = (const uint8_t*)(XIP_BASE + FLASH_META_OFFSET);
+        const uint8_t* meta = (const uint8_t*)(XIP_BASE + flashMetaOffset(bank));
 
         uint32_t magic; memcpy(&magic, meta, 4);
         if (magic != FLASH_MAGIC) return;
@@ -213,7 +219,7 @@ public:
         memcpy(&lsp, meta + 8, 4);
         if (len <= 0 || len > BUFFER_SIZE) return;
 
-        memcpy(sampleBuffer, (const uint8_t*)(XIP_BASE + FLASH_DATA_OFFSET), (size_t)len);
+        memcpy(sampleBuffer, (const uint8_t*)(XIP_BASE + flashDataOffset(bank)), (size_t)len);
 
         uint8_t storedXor = 0;
         memcpy(&storedXor, meta + 12, 1);
@@ -229,20 +235,18 @@ public:
 
     void saveToFlash()
     {
-        int len = sampleLen;
-
-        // Pause core 1 FIRST so we own the LEDs cleanly for all diagnostics.
-        // Core 1 called multicore_lockout_victim_init() and will park within ~21 µs.
+        // Pause core 1 first so we read consistently and own the LEDs.
         multicore_lockout_start_blocking();
+        int len  = sampleLen;
+        int bank = pendingBank;
 
-        // 5 rapid blinks = saveToFlash entered (ProcessSample paused, clean visuals).
+        // 5 rapid blinks = save entered.
         for (int b = 0; b < 5; b++) {
             for (int i = 0; i < 6; i++) LedOn(i, true);  sleep_ms(200);
             for (int i = 0; i < 6; i++) LedOn(i, false); sleep_ms(200);
         }
 
         if (len <= 0 || !hasSample) {
-            // 3 slow blinks = entered but nothing to save (len/hasSample invalid)
             for (int b = 0; b < 3; b++) {
                 LedOn(0, true); sleep_ms(500); LedOn(0, false); sleep_ms(500);
             }
@@ -272,28 +276,29 @@ public:
             memcpy(lastPage, sampleBuffer + fullBytes, remaining);
         }
         sleep_ms(500);
-        // All 6 LEDs = about to write flash
-        for (int i = 0; i < 6; i++) LedOn(i, true);
+        for (int i = 0; i < 6; i++) LedOn(i, true);  // all 6 = about to write
+
+        uint32_t dataOff = flashDataOffset(bank);
+        uint32_t metaOff = flashMetaOffset(bank);
 
         uint32_t ints = save_and_disable_interrupts();
 
-        flash_range_erase(FLASH_DATA_OFFSET, (FLASH_DATA_SECTORS + 1u) * FLASH_SECTOR_SIZE);
+        flash_range_erase(dataOff, FLASH_BANK_SECTORS * FLASH_SECTOR_SIZE);
         LedOn(5, false); // 5 LEDs = erase done, programming data
 
         if (fullBytes > 0)
-            flash_range_program(FLASH_DATA_OFFSET, sampleBuffer, fullBytes);
+            flash_range_program(dataOff, sampleBuffer, fullBytes);
         if (remaining > 0)
-            flash_range_program(FLASH_DATA_OFFSET + fullBytes, lastPage, FLASH_PAGE_SIZE);
+            flash_range_program(dataOff + fullBytes, lastPage, FLASH_PAGE_SIZE);
         LedOn(4, false); // 4 LEDs = data written, programming metadata
 
-        flash_range_program(FLASH_META_OFFSET, metaPage, FLASH_PAGE_SIZE);
+        flash_range_program(metaOff, metaPage, FLASH_PAGE_SIZE);
         LedOn(3, false); // 3 LEDs = metadata written
 
         restore_interrupts(ints);
-        // Core 1 still paused — verify and display result while we own the LEDs.
 
-        const uint8_t* fmeta = (const uint8_t*)(XIP_BASE + FLASH_META_OFFSET);
-        const uint8_t* fdata = (const uint8_t*)(XIP_BASE + FLASH_DATA_OFFSET);
+        const uint8_t* fmeta = (const uint8_t*)(XIP_BASE + metaOff);
+        const uint8_t* fdata = (const uint8_t*)(XIP_BASE + dataOff);
 
         // Verify magic
         uint32_t flash_magic_r = 0;
@@ -350,6 +355,18 @@ public:
 
     void MIDICore()
     {
+        // Give Core 1 time to start the ADC and get valid knob readings, then load
+        // the sample from whichever bank the X knob is pointing at.
+        sleep_ms(10);
+        multicore_lockout_start_blocking();
+        {
+            int loadBank = (KnobVal(Knob::X) * FLASH_NUM_BANKS) >> 12;
+            if (loadBank >= FLASH_NUM_BANKS) loadBank = FLASH_NUM_BANKS - 1;
+            loadFromFlash(loadBank);
+            bankIdx = loadBank;   // sync initial value so ProcessSample doesn't reset savedToFlash
+        }
+        multicore_lockout_end_blocking();
+
         // Wait for USB power state to settle, then detect host vs device
         sleep_us(150000);
         USBPowerState_t pwr = USBPowerState();
@@ -590,12 +607,23 @@ public:
         bool switchUp    = (sw == Switch::Up);
         bool switchJustUp = switchUp && !prevSwitchUp;
         prevSwitchUp = switchUp;
-        if (switchJustUp && hasSample && !savedToFlash)
-            flashPending = true;   // core 0 USB loop will call saveToFlash()
-
-        // --- Preset selection from X knob ---
-        presetIdx = (KnobVal(Knob::X) * NUM_PRESETS) >> 12;
+        // --- Preset selection (Main knob) and bank selection (X knob) ---
+        presetIdx = (KnobVal(Knob::Main) * NUM_PRESETS) >> 12;
         if (presetIdx >= NUM_PRESETS) presetIdx = NUM_PRESETS - 1;
+        {
+            int newBank = (KnobVal(Knob::X) * FLASH_NUM_BANKS) >> 12;
+            if (newBank >= FLASH_NUM_BANKS) newBank = FLASH_NUM_BANKS - 1;
+            if (newBank != bankIdx) {
+                bankIdx      = newBank;
+                savedToFlash = false;  // new bank: allow saving current sample here
+            }
+        }
+
+        // --- Save to flash ---
+        if (switchJustUp && hasSample && !savedToFlash) {
+            pendingBank  = bankIdx;   // lock in the bank now, not when saveToFlash runs
+            flashPending = true;
+        }
 
         // --- Voice processing ---
         int len = sampleLen;
@@ -734,28 +762,39 @@ public:
         if (recording) {
             for (int i = 0; i < 6; i++) LedOn(i, true);
         } else {
-            for (int i = 0; i < NUM_VOICES; i++) LedOn(i, voices[i].active);
-            if (flashPending) LedOn(5, (sampleCount >> 12) & 1u);  // blink while save pending
+            for (int i = 0; i < NUM_VOICES; i++) {
+                if (i == bankIdx && !voices[i].active) {
+                    // Selected bank LED: dim when idle, blink while save pending
+                    if (flashPending)
+                        LedOn(i, (sampleCount >> 12) & 1u);
+                    else
+                        LedBrightness(i, 2048);
+                } else {
+                    LedOn(i, voices[i].active);
+                }
+            }
         }
     }
 
 private:
     volatile bool flashPending;   // set by core1 ProcessSample; serviced by core0 MIDICore
+    volatile int  bankIdx;        // active sample bank 0-5, set by X knob in ProcessSample
+    volatile int  pendingBank;    // bank locked in at the moment flashPending is set
 
     bool         recording;
     bool         prevSwitchDown;
     bool         prevSwitchUp;
-    bool         savedToFlash;
+    volatile bool savedToFlash;
     bool         isUSBMIDIHost;
     int          writeHead;
-    int          recordDecimate;  // toggles 0/1 to halve the recording sample rate
+    int          recordDecimate;
     volatile int  presetIdx;
-    volatile int  loopStartPt;     // upward zero-crossing near 50% of buffer
+    volatile int  loopStartPt;
     volatile bool    pendingDelayCapture;
     int              delayKnobY;
     volatile bool    pendingCVNoteOn;
     volatile uint8_t pendingCVNote;
-    bool             gateState;        // last value written to PulseOut1
+    bool             gateState;
 
 public:
     static uint8_t midi_dev_addr;
@@ -799,7 +838,7 @@ void tuh_midi_tx_cb(uint8_t dev_addr) { (void)dev_addr; }
 
 int main()
 {
-    set_sys_clock_khz(200000, true);   // 200 MHz – comfortable headroom for 6-voice processing
+    set_sys_clock_khz(192000, true);   // 192 MHz = 48 kHz × 4000 — clean audio clock multiple
     VSS vss;
     VSS::s_instance = &vss;   // audioEntry() needs this before Run() sets thisptr
     // Audio on core 1 (lockout victim); USB + flash save on core 0 (main thread).
