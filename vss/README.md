@@ -8,7 +8,7 @@ Audio is recorded and stored at 24 kHz using µ-law compression (8 bits/sample),
 
 VSS stores up to 6 independent samples in flash (banks 0–5). The X knob selects the active bank, shown as a dimly lit LED (LEDs 0–5 = banks 0–5).
 
-- **Loading**: the bank selected by the X knob is loaded automatically on power-on. Set the knob before powering up.
+- **Loading**: the bank selected by the X knob is loaded on power-on. The playing sample does not change mid-session when the knob moves.
 - **Saving**: flip Z switch up after recording to save to the current bank. Banks are independent — saving to one does not affect the others.
 
 ## Recording
@@ -46,7 +46,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 | Control | Function |
 |---------|----------|
 | Main knob | ADSR envelope preset (see table below) |
-| X knob    | Sample bank select (0–5, shown as dimly lit LED) |
+| X knob    | Sample bank select (0–5, loaded on power-on) |
 | Y knob    | Delay time, sampled on each note-on — slapback (~50 ms) to long echo (~750 ms) |
 | Z switch down | Record |
 | Z switch up   | Save to current bank |

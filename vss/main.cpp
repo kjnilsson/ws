@@ -209,6 +209,11 @@ public:
 
     void loadFromFlash(int bank)
     {
+        // Clear sample state first — if the load fails the bank is treated as empty.
+        sampleLen    = 0;
+        hasSample    = false;
+        savedToFlash = false;
+
         const uint8_t* meta = (const uint8_t*)(XIP_BASE + flashMetaOffset(bank));
 
         uint32_t magic; memcpy(&magic, meta, 4);
@@ -355,9 +360,13 @@ public:
 
     void MIDICore()
     {
-        // Give Core 1 time to start the ADC and get valid knob readings, then load
-        // the sample from whichever bank the X knob is pointing at.
-        sleep_ms(10);
+        // Wait for USB power state to settle AND for the knob IIR filter to converge.
+        // ComputerCard's filter starts at 0 on boot; it takes ~150 ms at 12 kHz updates
+        // to reach the true ADC value.  Reading the X knob too early would select the
+        // wrong bank (e.g. knob at bank 1 reads as bank 0 after only 10 ms).
+        sleep_us(150000);   // USB settle + knob IIR convergence (~150 ms for IIR to converge from 0)
+
+        // Now read the (fully converged) X knob and load the correct bank.
         multicore_lockout_start_blocking();
         {
             int loadBank = (KnobVal(Knob::X) * FLASH_NUM_BANKS) >> 12;
@@ -366,9 +375,6 @@ public:
             bankIdx = loadBank;   // sync initial value so ProcessSample doesn't reset savedToFlash
         }
         multicore_lockout_end_blocking();
-
-        // Wait for USB power state to settle, then detect host vs device
-        sleep_us(150000);
         USBPowerState_t pwr = USBPowerState();
         isUSBMIDIHost = (pwr == DFP);   // DFP = keyboard plugged in → we are host
                                          // UFP / Unsupported → plugged into laptop → device
@@ -614,8 +620,7 @@ public:
             int newBank = (KnobVal(Knob::X) * FLASH_NUM_BANKS) >> 12;
             if (newBank >= FLASH_NUM_BANKS) newBank = FLASH_NUM_BANKS - 1;
             if (newBank != bankIdx) {
-                bankIdx      = newBank;
-                savedToFlash = false;  // new bank: allow saving current sample here
+                bankIdx = newBank;
             }
         }
 
