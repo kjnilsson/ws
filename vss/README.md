@@ -11,6 +11,22 @@ VSS stores up to 6 independent samples in flash (banks 0–5). The X knob select
 - **Loading**: the bank selected by the X knob is loaded on power-on. The playing sample does not change mid-session when the knob moves.
 - **Saving**: flip Z switch up after recording to save to the current bank. Banks are independent — saving to one does not affect the others.
 
+## Configuration mode
+
+Hold the **Z switch down while powering on** (or reloading the card). After ~150 ms the module enters configuration mode, indicated by LED 5 blinking slowly.
+
+Turn the **Main knob** to select the MIDI receive channel. Release the switch to save and exit.
+
+| LEDs 0–4 | MIDI channel |
+|----------|-------------|
+| All off  | Omni (respond to all channels) |
+| 00001    | Channel 1 |
+| 00010    | Channel 2 |
+| … | … |
+| 10000    | Channel 16 |
+
+The setting is saved to flash and restored on every power-on.
+
 ## Recording
 
 Hold the **Z switch down**. All six LEDs light to confirm recording is in progress. Release the switch (or wait for the buffer to fill) to stop. The sample is ready to play immediately.

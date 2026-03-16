@@ -97,12 +97,19 @@ static const uint32_t FLASH_DATA_SECTORS = ((uint32_t)BUFFER_SIZE + FLASH_SECTOR
 static const uint32_t FLASH_BANK_SECTORS = FLASH_DATA_SECTORS + 1u;   // 37 per bank
 static const int      FLASH_NUM_BANKS    = 6;
 static const uint32_t FLASH_MAGIC        = 0x56535302u;  // 'V','S','S', version 2 (+ XOR field)
+static const uint32_t FLASH_CONFIG_MAGIC = 0x56535343u;  // 'V','S','S','C'
 
 static uint32_t flashDataOffset(int bank) {
     return PICO_FLASH_SIZE_BYTES - (uint32_t)(bank + 1) * FLASH_BANK_SECTORS * FLASH_SECTOR_SIZE;
 }
 static uint32_t flashMetaOffset(int bank) {
     return flashDataOffset(bank) + FLASH_DATA_SECTORS * FLASH_SECTOR_SIZE;
+}
+// Config sector: one sector immediately before (lower address than) all sample banks.
+// Format: [0-3] magic  [4] midiChannel (0=omni,1-16)  [5-255] reserved (0xFF)
+static uint32_t flashConfigOffset() {
+    return PICO_FLASH_SIZE_BYTES
+           - (uint32_t)(FLASH_NUM_BANKS * FLASH_BANK_SECTORS + 1u) * FLASH_SECTOR_SIZE;
 }
 
 static uint8_t sampleBuffer[BUFFER_SIZE] __attribute__((aligned(4)));
@@ -181,7 +188,10 @@ struct MIDIMsg {
     Cmd     cmd;
     uint8_t note, vel;
 
-    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0) {
+    uint8_t channel;  // 1-16
+
+    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0),
+                                   channel((p[0] & 0x0F) + 1) {
         switch (p[0] & 0xF0) {
         case 0x90: cmd = NoteOn;  note = p[1]; vel = p[2]; break;
         case 0x80: cmd = NoteOff; note = p[1]; vel = p[2]; break;
@@ -202,7 +212,8 @@ public:
             pendingDelayCapture(false), delayKnobY(0),
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false),
             flashPending(false), bankIdx(0), pendingBank(0),
-            arpIdx(-1), arpGateTimer(0), arpIntTimer(0)
+            arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
+            midiChannel(0), inConfigMode(false), configMidiChan(0)
     {
     }
 
@@ -237,6 +248,50 @@ public:
         loopStartPt  = lsp;
         hasSample    = true;
         savedToFlash = true;
+    }
+
+    // ---- Config load/save/mode -----------------------------------------
+
+    void loadConfig()
+    {
+        const uint8_t* p = (const uint8_t*)(XIP_BASE + flashConfigOffset());
+        uint32_t magic; memcpy(&magic, p, 4);
+        if (magic != FLASH_CONFIG_MAGIC) { midiChannel = 0; return; }
+        midiChannel = p[4];
+        if (midiChannel > 16) midiChannel = 0;
+    }
+
+    void saveConfig()
+    {
+        static uint8_t cfgPage[FLASH_PAGE_SIZE] __attribute__((aligned(4)));
+        memset(cfgPage, 0xFF, FLASH_PAGE_SIZE);
+        uint32_t magic = FLASH_CONFIG_MAGIC;
+        memcpy(cfgPage, &magic, 4);
+        cfgPage[4] = midiChannel;
+
+        multicore_lockout_start_blocking();
+        uint32_t ints = save_and_disable_interrupts();
+        flash_range_erase(flashConfigOffset(), FLASH_SECTOR_SIZE);
+        flash_range_program(flashConfigOffset(), cfgPage, FLASH_PAGE_SIZE);
+        restore_interrupts(ints);
+        multicore_lockout_end_blocking();
+    }
+
+    // Called from MIDICore() when the Z switch is held at boot.
+    // Core 1 is already running; inConfigMode tells ProcessSample to
+    // display the channel in binary on LEDs 0-4 (LED 5 = slow blink).
+    // Exits when the switch is released, then saves config to flash.
+    void runConfigMode()
+    {
+        inConfigMode = true;
+        while (SwitchVal() == Switch::Down) {
+            // Map Main knob 0-4095 to channel 0-16 (0 = omni)
+            configMidiChan = (uint8_t)((KnobVal(Knob::Main) * 17) >> 12);
+            sleep_ms(10);
+        }
+        midiChannel    = configMidiChan;
+        inConfigMode   = false;
+        saveConfig();
     }
 
     void saveToFlash()
@@ -367,6 +422,13 @@ public:
         // wrong bank (e.g. knob at bank 1 reads as bank 0 after only 10 ms).
         sleep_us(150000);   // USB settle + knob IIR convergence (~150 ms for IIR to converge from 0)
 
+        // Config mode: hold Z switch down while powering on.
+        if (SwitchVal() == Switch::Down)
+            runConfigMode();
+
+        // Load persisted config (MIDI channel filter etc.)
+        loadConfig();
+
         // Now read the (fully converged) X knob and load the correct bank.
         multicore_lockout_start_blocking();
         {
@@ -434,6 +496,9 @@ public:
 
     void handleMIDI(const MIDIMsg& m)
     {
+        // midiChannel 0 = omni (accept all); otherwise filter by channel
+        if (midiChannel != 0 && m.channel != midiChannel) return;
+
         if (m.cmd == MIDIMsg::NoteOn && m.vel > 0)
             noteOn(m.note);
         else if (m.cmd == MIDIMsg::NoteOff ||
@@ -805,7 +870,13 @@ public:
         static uint32_t sampleCount = 0;
         ++sampleCount;
 
-        if (recording) {
+        if (inConfigMode) {
+            // LEDs 0-4: MIDI channel in binary (0 = omni = all off, 1-16 = channel)
+            // LED 5: slow blink to indicate config mode
+            uint8_t ch = configMidiChan;
+            for (int i = 0; i < 5; i++) LedOn(i, (ch >> i) & 1u);
+            LedOn(5, (sampleCount >> 15) & 1u);
+        } else if (recording) {
             for (int i = 0; i < 6; i++) LedOn(i, true);
         } else {
             for (int i = 0; i < NUM_VOICES; i++) {
@@ -847,6 +918,11 @@ private:
     int  arpGateTimer;  // samples until Gate Out 2 goes low
     int  arpIntTimer;   // internal delay-synced tick counter
     static constexpr int ARP_GATE_LEN = 2400;  // 50 ms gate pulse
+
+    // Config
+    uint8_t          midiChannel;     // 0 = omni, 1-16 = specific channel
+    volatile bool    inConfigMode;    // tells ProcessSample to show config LEDs
+    volatile uint8_t configMidiChan;  // channel being dialled in during config mode
 
 public:
     static uint8_t midi_dev_addr;
