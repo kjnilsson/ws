@@ -936,7 +936,7 @@ public:
                     else
                         LedBrightness(i, 2048);
                 } else {
-                    LedOn(i, voices[i].active);
+                    LedBrightness(i, voices[i].active ? (uint16_t)(voices[i].envAccum >> 12) : 0);
                 }
             }
             if (tunerMode && !tunerCounter) {
