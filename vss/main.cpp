@@ -67,9 +67,10 @@ static const ADSRPreset PRESETS[] = {
     { "Harpsichord",     2,   900,   0,   120 },
     { "Organ",           5,     0, 255,    30 },
     { "Strings",       150,   300, 210,   700 },
-    { "Pad",           500,   800, 225,  1100 },
-    { "Choir",         350,   500, 230,  1000 },
-    { "Slow Sweep",   1200,  2500, 210,  2500 },
+    { "Pad",           500,   800, 225,  1500 },
+    { "Choir",         350,   500, 230,  1800 },
+    { "Slow Sweep",   1200,  2500, 210,  4000 },
+    { "Rhubarb",       800,  1000, 245,  7000 },
 };
 
 static const int NUM_PRESETS = (int)(sizeof(PRESETS) / sizeof(PRESETS[0]));
@@ -83,13 +84,14 @@ static const uint32_t SAMPLE_RATE = 48000;
 static const int      RECORD_RATE = SAMPLE_RATE / 2;          // 24 kHz
 static const int      BUFFER_SIZE = RECORD_RATE * 6;          // 144 000 bytes ≈ 141 KB, 6 s
 
-// Loop crossfade length in samples (~5 ms at 48 kHz).
+// Loop crossfade length in samples (~170 ms at base pitch).
 // When pos enters the last XFADE_LEN samples before the loop end, we
 // simultaneously read from the corresponding position at the loop start and
 // linearly blend between them.  After the wrap we resume from
 // loopStart + XFADE_LEN, so the first post-wrap output sample is adjacent to
 // the last crossfade output sample — no discontinuity, no click.
-static const int XFADE_LEN = 1024;
+static const int XFADE_LEN = 4096;  // must be a power of 2
+static_assert((XFADE_LEN & (XFADE_LEN - 1)) == 0, "XFADE_LEN must be a power of 2");
 
 // Flash storage layout (end of 2 MB flash), 6 banks stacked from the end:
 //   each bank = 36 data sectors + 1 meta sector = 37 sectors = 148 KB
@@ -141,6 +143,19 @@ static uint32_t adsrRate(uint32_t ms)
     return rate < 1u ? 1u : rate;
 }
 
+// Exponential release shift: each sample envAccum -= envAccum >> shift.
+// τ (time constant) = 2^shift samples.  We pick shift so that τ ≈ ms/5,
+// meaning the envelope reaches ~1 % (-40 dB) in roughly `ms` milliseconds.
+static uint8_t releaseShiftFn(uint32_t ms)
+{
+    if (ms == 0) return 0;                      // instant: drain in one sample
+    uint32_t tau = ms * SAMPLE_RATE / 5000u;    // τ in samples
+    if (tau < 1u) tau = 1u;
+    uint8_t shift = 0;
+    while (tau > 1u && shift < 20u) { tau >>= 1; ++shift; }
+    return shift;
+}
+
 // Rate to decay over a partial swing (= ENV_MAX - sustainLevel) in `ms` ms
 static uint32_t decayRateFn(uint32_t ms, uint32_t swing)
 {
@@ -167,14 +182,14 @@ struct Voice {
     volatile uint32_t    attackRate;
     volatile uint32_t    decayRate;
     volatile uint32_t    sustainAccum; // sustainLevel × 256
-    volatile uint32_t    releaseRate;
+    volatile uint8_t     releaseShift; // exponential release: envAccum -= envAccum >> releaseShift
     volatile VoiceState  state;
     volatile uint32_t    age;          // voice-stealing: larger = older
 
     Voice()
         : active(false), note(0), phase(0), step(256u),
           envAccum(0), attackRate(1u), decayRate(1u),
-          sustainAccum(0), releaseRate(1u),
+          sustainAccum(0), releaseShift(8u),
           state(VS_IDLE), age(0) {}
 };
 
@@ -528,7 +543,7 @@ public:
         uint32_t swing    = ENV_MAX - susLev;                 // decay swing
         uint32_t aRate    = adsrRate(p.attack_ms);
         uint32_t dRate    = decayRateFn(p.decay_ms, swing);
-        uint32_t rRate    = adsrRate(p.release_ms);
+        uint8_t  rShift   = releaseShiftFn(p.release_ms);
 
         // Voice selection priority:
         //   1. Any free (inactive / idle) voice          → envelope starts at 0
@@ -539,7 +554,7 @@ public:
         int freeSlot      = -1;
         int sameReleasing = -1;
         int sameActive    = -1;
-        uint32_t oldestAge = 0;
+        uint32_t oldestAge = UINT32_MAX;
         int      oldest    = 0;
 
         for (int i = 0; i < NUM_VOICES; i++) {
@@ -551,7 +566,7 @@ public:
                 if (voices[i].state == VS_RELEASE) sameReleasing = i;
                 else                               sameActive    = i;
             }
-            if (voices[i].age > oldestAge) { oldestAge = voices[i].age; oldest = i; }
+            if (voices[i].age < oldestAge) { oldestAge = voices[i].age; oldest = i; }
         }
 
         int  slot            = -1;
@@ -574,7 +589,7 @@ public:
         voices[slot].sustainAccum = susAccum;
         voices[slot].attackRate   = aRate;
         voices[slot].decayRate    = dRate;
-        voices[slot].releaseRate  = rRate;
+        voices[slot].releaseShift = rShift;
         voices[slot].envAccum     = startEnv;
         voices[slot].state        = VS_ATTACK;
         voices[slot].age          = ++voiceAgeCtr;
@@ -613,7 +628,7 @@ public:
     void computeLoopStart()
     {
         int len     = sampleLen;
-        int nominal = len / 2;
+        int nominal = (len * 2) / 3;
         int lo = nominal - XFADE_LEN;  if (lo < 1)    lo = 1;
         int hi = nominal + XFADE_LEN;  if (hi >= len) hi = len - 1;
 
@@ -712,7 +727,7 @@ public:
         int32_t mix = 0;
 
         if (len > 0) {
-            int loopStart = loopStartPt > 0 ? loopStartPt : len >> 1;
+            int loopStart = loopStartPt > 0 ? loopStartPt : (len * 2) / 3;
             int loopLen   = len - loopStart;
 
             // Runtime crossfade: is the loop long enough to support it?
@@ -745,7 +760,7 @@ public:
                 int16_t smp;
                 if (canXfade && pos >= xfZoneStart) {
                     int xOff = pos - xfZoneStart;           // 0 .. XFADE_LEN-1
-                    int t    = (xOff * 256) / XFADE_LEN;   // 0..255 linear
+                    int t    = (xOff << 8) >> 12;          // 0..255 linear  (= xOff*256/4096)
                     // Smoothstep: 3t² - 2t³  (avoids the level dip of a linear crossfade)
                     int t2   = (t * t) >> 8;                // t² normalised to 0..255
                     int t3   = (t2 * t) >> 8;               // t³ normalised to 0..255
@@ -782,15 +797,18 @@ public:
                     voices[i].envAccum = voices[i].sustainAccum;
                     break;
 
-                case VS_RELEASE:
-                    if (voices[i].envAccum > voices[i].releaseRate) {
-                        voices[i].envAccum -= voices[i].releaseRate;
+                case VS_RELEASE: {
+                    uint32_t drop = voices[i].envAccum >> voices[i].releaseShift;
+                    if (drop == 0) drop = 1;   // ensure termination at very low levels
+                    if (voices[i].envAccum > drop) {
+                        voices[i].envAccum -= drop;
                     } else {
                         voices[i].envAccum = 0;
                         voices[i].active   = false;
                         voices[i].state    = VS_IDLE;
                     }
                     break;
+                }
 
                 default:
                     break;
@@ -831,7 +849,8 @@ public:
         } else if (gateState) {
             bool noteStillPlaying = false;
             for (int i = 0; i < NUM_VOICES; i++)
-                if (voices[i].active && voices[i].note == cvGateNote)
+                if (voices[i].active && voices[i].note == cvGateNote
+                    && voices[i].state != VS_RELEASE)
                     { noteStillPlaying = true; break; }
             if (!noteStillPlaying) { PulseOut1(false); gateState = false; }
         }

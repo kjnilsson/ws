@@ -93,6 +93,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 | 8 | Pad | Very slow attack, long release |
 | 9 | Choir | Slow swell, breathy sustain |
 | 10 | Slow Sweep | Very slow attack and release |
+| 11 | Rhubarb    | Soft attack, very long release, near-full sustain |
 
 ## Arpeggiator (CV Out 2 / Gate Out 2)
 
