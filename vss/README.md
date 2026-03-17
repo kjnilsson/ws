@@ -74,7 +74,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 |--------|--------|
 | Audio Out 1 | Dry polyphonic mix (or Audio In 1 passthrough in tuner mode) |
 | Audio Out 2 | Tape-style echo (wet only) |
-| CV Out 1    | Lowest held MIDI note as 1V/oct (or middle C in tuner mode) |
+| CV Out 1    | Lowest held MIDI note as 1V/oct, one octave down (or middle C in tuner mode) |
 | Gate Out 1  | High while any voice is active |
 | CV Out 2    | Arpeggiator pitch (1V/oct) |
 | Gate Out 2  | Arpeggiator gate (~50 ms pulse per step) |
@@ -97,7 +97,7 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 
 ## Arpeggiator (CV Out 2 / Gate Out 2)
 
-The arpeggiator cycles upward through all currently held MIDI notes, outputting each as a 1V/oct pitch on CV Out 2 with a ~50 ms gate pulse on Gate Out 2.
+The arpeggiator cycles upward through all currently held MIDI notes, outputting each as a 1V/oct pitch on CV Out 2 with a ~50 ms gate pulse on Gate Out 2. Each step has a 50 % chance of being shifted down one octave for rhythmic variation.
 
 **Clock source** — plug a clock or gate signal into Gate In 2 and the arpeggiator steps on each rising edge. If nothing is connected, it steps automatically in time with the Y-knob delay period (so the arp and echo are naturally in sync).
 

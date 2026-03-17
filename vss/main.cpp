@@ -841,7 +841,7 @@ public:
         } else if (pendingCVNoteOn) {
             if (!gateState) {
                 cvGateNote = pendingCVNote;
-                CVOut1MIDINote(cvGateNote);
+                CVOut1MIDINote(cvGateNote > 11 ? cvGateNote - 12 : cvGateNote);
                 PulseOut1(true);
                 gateState = true;
             }
@@ -895,7 +895,14 @@ public:
 
         if (arpTick && arpCount > 0) {
             arpIdx = (arpIdx + 1) % arpCount;
-            CVOut2MIDINote(arpNotes[arpIdx]);
+            // 50 % chance of octave-up shift
+            static uint32_t arpRand = 0xdeadbeef;
+            arpRand ^= arpRand << 13;
+            arpRand ^= arpRand >> 17;
+            arpRand ^= arpRand << 5;
+            uint8_t arpNote = arpNotes[arpIdx] - ((arpRand & 1u) ? 12u : 0u);
+            if (arpNote > 127) arpNote = 0;   // underflow guard
+            CVOut2MIDINote(arpNote);
             PulseOut2(true);
             arpGateTimer = ARP_GATE_LEN;
         }
