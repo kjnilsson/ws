@@ -213,7 +213,8 @@ public:
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false),
             flashPending(false), bankIdx(0), pendingBank(0),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
-            midiChannel(0), inConfigMode(false), configMidiChan(0)
+            midiChannel(0), inConfigMode(false), configMidiChan(0),
+            presetFlashTimer(0)
     {
     }
 
@@ -680,8 +681,14 @@ public:
         bool switchJustUp = switchUp && !prevSwitchUp;
         prevSwitchUp = switchUp;
         // --- Preset selection (Main knob) and bank selection (X knob) ---
-        presetIdx = (KnobVal(Knob::Main) * NUM_PRESETS) >> 12;
-        if (presetIdx >= NUM_PRESETS) presetIdx = NUM_PRESETS - 1;
+        {
+            int newPreset = (KnobVal(Knob::Main) * NUM_PRESETS) >> 12;
+            if (newPreset >= NUM_PRESETS) newPreset = NUM_PRESETS - 1;
+            if (newPreset != presetIdx) {
+                presetIdx       = newPreset;
+                presetFlashTimer = PRESET_FLASH_LEN;
+            }
+        }
         {
             int newBank = (KnobVal(Knob::X) * FLASH_NUM_BANKS) >> 12;
             if (newBank >= FLASH_NUM_BANKS) newBank = FLASH_NUM_BANKS - 1;
@@ -880,7 +887,10 @@ public:
             for (int i = 0; i < 6; i++) LedOn(i, true);
         } else {
             for (int i = 0; i < NUM_VOICES; i++) {
-                if (i == bankIdx && !voices[i].active) {
+                if (i == 5 && presetFlashTimer > 0) {
+                    LedOn(5, true);
+                    --presetFlashTimer;
+                } else if (i == bankIdx && !voices[i].active) {
                     // Selected bank LED: dim when idle, blink while save pending
                     if (flashPending)
                         LedOn(i, (sampleCount >> 12) & 1u);
@@ -906,6 +916,8 @@ private:
     int          writeHead;
     int          recordDecimate;
     volatile int  presetIdx;
+    int           presetFlashTimer;
+    static constexpr int PRESET_FLASH_LEN = 4800;  // 100 ms at 48 kHz
     volatile int  loopStartPt;
     volatile bool    pendingDelayCapture;
     int              delayKnobY;
