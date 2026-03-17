@@ -30,6 +30,7 @@
 
 #include "ComputerCard.h"
 #include "MuLawCodec.h"
+#include "../Tuner.h"
 #include "Delay.h"
 #include "pico/multicore.h"
 #include "hardware/flash.h"
@@ -214,7 +215,7 @@ public:
             flashPending(false), bankIdx(0), pendingBank(0),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0),
-            presetFlashTimer(0)
+            presetFlashTimer(0), tunerCounter(0)
     {
     }
 
@@ -304,13 +305,13 @@ public:
 
         // 5 rapid blinks = save entered.
         for (int b = 0; b < 5; b++) {
-            for (int i = 0; i < 6; i++) LedOn(i, true);  sleep_ms(200);
-            for (int i = 0; i < 6; i++) LedOn(i, false); sleep_ms(200);
+            for (int i = 0; i < 6; i++) LedOn(i, true);  sleep_ms(100);
+            for (int i = 0; i < 6; i++) LedOn(i, false); sleep_ms(100);
         }
 
         if (len <= 0 || !hasSample) {
             for (int b = 0; b < 3; b++) {
-                LedOn(0, true); sleep_ms(500); LedOn(0, false); sleep_ms(500);
+                LedOn(0, true); sleep_ms(250); LedOn(0, false); sleep_ms(250);
             }
             multicore_lockout_end_blocking();
             flashPending = false;
@@ -337,7 +338,7 @@ public:
             memset(lastPage, 0, FLASH_PAGE_SIZE);
             memcpy(lastPage, sampleBuffer + fullBytes, remaining);
         }
-        sleep_ms(500);
+        sleep_ms(300);
         for (int i = 0; i < 6; i++) LedOn(i, true);  // all 6 = about to write
 
         uint32_t dataOff = flashDataOffset(bank);
@@ -392,9 +393,9 @@ public:
         for (int b = 0; b < 4; b++) {
             LedOn(5, magicOk); LedOn(4, lenOk); LedOn(3, lspOk); LedOn(2, xorOk);
             LedOn(1, false); LedOn(0, false);
-            sleep_ms(600);
+            sleep_ms(300);
             for (int i = 0; i < 6; i++) LedOn(i, false);
-            sleep_ms(200);
+            sleep_ms(100);
         }
 
         bool ok = magicOk && lenOk && lspOk && xorOk;
@@ -634,6 +635,9 @@ public:
 
     virtual void ProcessSample() override
     {
+        bool tunerMode = Connected(Input::Audio2);
+        if (tunerMode) tunerPd.addSample(AudioIn1());
+
         // --- Recording (Z switch Down = momentary press) ---
         Switch sw = SwitchVal();
         bool switchDown = (sw == Switch::Down);
@@ -806,14 +810,15 @@ public:
         if (mix >  2047) mix =  2047;
         if (mix < -2048) mix = -2048;
 
-        AudioOut1((int16_t)mix);
+        // Audio Out 1: passthrough of Audio In 1 in tuner mode; dry voice mix otherwise.
+        AudioOut1(tunerMode ? AudioIn1() : (int16_t)mix);
 
         // CV Out 1 / Gate Out 1:
-        //   - CV updates only on note-on, set to the lowest held note at that moment
-        //   - Gate goes high on that same note-on, stays high until all voices
-        //     have fully finished their release envelopes, then goes low and waits
-        //     for the next note-on.  Note-offs never change CV or cause retriggering.
-        if (pendingCVNoteOn) {
+        //   In tuner mode (dummy cable in Audio In 2): CV Out 1 = middle C reference.
+        //   Otherwise: CV tracks the lowest held MIDI note; gate follows voice activity.
+        if (tunerMode) {
+            CVOut1MIDINote(60);
+        } else if (pendingCVNoteOn) {
             CVOut1MIDINote(pendingCVNote);
             if (!gateState) { PulseOut1(true);  gateState = true; }
             pendingCVNoteOn = false;
@@ -824,7 +829,7 @@ public:
             if (!anyActive) { PulseOut1(false); gateState = false; }
         }
 
-        // Audio Out 2: delay wet only.  Y knob sampled on each note-on.
+        // Audio Out 2: delay wet only (unchanged by tuner mode).
         if (pendingDelayCapture) {
             delayKnobY          = KnobVal(Knob::Y);
             pendingDelayCapture = false;
@@ -887,6 +892,7 @@ public:
             for (int i = 0; i < 6; i++) LedOn(i, true);
         } else {
             for (int i = 0; i < NUM_VOICES; i++) {
+                if (tunerMode && (i == 0 || i == 2 || i == 4)) continue;
                 if (i == 5 && presetFlashTimer > 0) {
                     LedOn(5, true);
                     --presetFlashTimer;
@@ -900,6 +906,14 @@ public:
                     LedOn(i, voices[i].active);
                 }
             }
+            if (tunerMode && !tunerCounter) {
+                // LEDs 0/2/4: tuner display (flat=4, center=2, sharp=0)
+                TunerLedValues v = tunerLedValues(periodToCloseness(tunerPd.period()));
+                LedBrightness(4, v.flat);
+                LedBrightness(2, v.center);
+                LedBrightness(0, v.sharp);
+            }
+            tunerCounter++;
         }
     }
 
@@ -935,6 +949,10 @@ private:
     uint8_t          midiChannel;     // 0 = omni, 1-16 = specific channel
     volatile bool    inConfigMode;    // tells ProcessSample to show config LEDs
     volatile uint8_t configMidiChan;  // channel being dialled in during config mode
+
+    // Tuner (active when Audio In 2 is connected)
+    PitchDetector tunerPd;
+    uint8_t       tunerCounter;      // wraps every 256 samples for display update
 
 public:
     static uint8_t midi_dev_addr;
@@ -981,6 +999,7 @@ int main()
     set_sys_clock_khz(192000, true);   // 192 MHz = 48 kHz × 4000 — clean audio clock multiple
     VSS vss;
     VSS::s_instance = &vss;   // audioEntry() needs this before Run() sets thisptr
+    vss.EnableNormalisationProbe();   // must be before Run() (called inside audioEntry)
     // Audio on core 1 (lockout victim); USB + flash save on core 0 (main thread).
     // This matches the reverb card architecture: flash ops happen from the non-ISR
     // core so multicore_lockout_start_blocking() is safe to call.

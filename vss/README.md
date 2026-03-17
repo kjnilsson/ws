@@ -72,9 +72,9 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 
 | Output | Signal |
 |--------|--------|
-| Audio Out 1 | Dry polyphonic mix |
+| Audio Out 1 | Dry polyphonic mix (or Audio In 1 passthrough in tuner mode) |
 | Audio Out 2 | Tape-style echo (wet only) |
-| CV Out 1    | Lowest held MIDI note as 1V/oct |
+| CV Out 1    | Lowest held MIDI note as 1V/oct (or middle C in tuner mode) |
 | Gate Out 1  | High while any voice is active |
 | CV Out 2    | Arpeggiator pitch (1V/oct) |
 | Gate Out 2  | Arpeggiator gate (~50 ms pulse per step) |
@@ -116,3 +116,24 @@ Mix Audio Out 1 (dry) and Audio Out 2 (wet) externally to taste.
 | 0–5 all lit | Recording in progress |
 | One LED dimly lit | Selected sample bank (X knob position) |
 | Dimly lit LED blinking | Save pending |
+
+In tuner mode (see below), LEDs 0, 2, and 4 show the tuner display instead of voice activity.
+
+## Tuner mode
+
+Insert a dummy cable (or any cable) into **Audio In 2** to activate the built-in tuner. While the cable is present:
+
+- **Audio In 1** is monitored for pitch — patch your oscillator here.
+- **Audio Out 1** passes Audio In 1 through directly so you can monitor the oscillator.
+- **CV Out 1** outputs middle C (C4, ~261.6 Hz) as a tuning reference instead of tracking MIDI notes.
+- **LEDs 0, 2, 4** show the tuner display:
+
+| LED | Meaning |
+|-----|---------|
+| 0   | Sharp — oscillator is above a C; fades to off as pitch approaches C |
+| 2   | In tune — fully lit when exactly on a C; fades with deviation |
+| 4   | Flat — oscillator is below a C; fades to off as pitch approaches C |
+
+All three LEDs off = no signal detected. The tuner works across the full audio range (20 Hz – 4 kHz) and compares to the nearest C in any octave.
+
+Remove the cable from Audio In 2 to return to normal sampler operation.
