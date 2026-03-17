@@ -211,7 +211,7 @@ public:
             prevSwitchDown(true), prevSwitchUp(false),
             loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false),
             pendingDelayCapture(false), delayKnobY(0),
-            pendingCVNoteOn(false), pendingCVNote(0), gateState(false),
+            pendingCVNoteOn(false), pendingCVNote(0), gateState(false), cvGateNote(0),
             flashPending(false), bankIdx(0), pendingBank(0),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0),
@@ -814,19 +814,26 @@ public:
         AudioOut1(tunerMode ? AudioIn1() : (int16_t)mix);
 
         // CV Out 1 / Gate Out 1:
-        //   In tuner mode (dummy cable in Audio In 2): CV Out 1 = middle C reference.
-        //   Otherwise: CV tracks the lowest held MIDI note; gate follows voice activity.
+        //   In tuner mode: CV Out 1 = middle C reference (gate unused).
+        //   Otherwise: triggers on the first note-on that is the lowest playing note,
+        //   but only when the gate is currently low. Holds the gate high until that
+        //   specific note's voice finishes completely, then waits for the next trigger.
         if (tunerMode) {
             CVOut1MIDINote(60);
         } else if (pendingCVNoteOn) {
-            CVOut1MIDINote(pendingCVNote);
-            if (!gateState) { PulseOut1(true);  gateState = true; }
+            if (!gateState) {
+                cvGateNote = pendingCVNote;
+                CVOut1MIDINote(cvGateNote);
+                PulseOut1(true);
+                gateState = true;
+            }
             pendingCVNoteOn = false;
         } else if (gateState) {
-            bool anyActive = false;
+            bool noteStillPlaying = false;
             for (int i = 0; i < NUM_VOICES; i++)
-                if (voices[i].active) { anyActive = true; break; }
-            if (!anyActive) { PulseOut1(false); gateState = false; }
+                if (voices[i].active && voices[i].note == cvGateNote)
+                    { noteStillPlaying = true; break; }
+            if (!noteStillPlaying) { PulseOut1(false); gateState = false; }
         }
 
         // Audio Out 2: delay wet only (unchanged by tuner mode).
@@ -938,6 +945,7 @@ private:
     volatile bool    pendingCVNoteOn;
     volatile uint8_t pendingCVNote;
     bool             gateState;
+    uint8_t          cvGateNote;    // note currently committed to CV Out 1 / Gate Out 1
 
     // Arpeggiator
     int  arpIdx;        // current note index (-1 = reset)
