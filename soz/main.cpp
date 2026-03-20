@@ -1,4 +1,4 @@
-// pnch — flash scratchpad sampler
+// soz — flash scratchpad sampler
 //
 // A durable audio scratchpad stored in flash.  Record patchwork audio into
 // arbitrary positions, then loop-play any region.  Survives power cycles.
@@ -74,10 +74,10 @@ static inline int16_t readFlashSample(uint32_t sampleIdx)
     return *p;
 }
 
-class Pnch : public ComputerCard
+class Soz : public ComputerCard
 {
 public:
-    Pnch()
+    Soz()
         : cursorSample(0), playPos(0), playOffset(0), playLoopLen(TOTAL_SAMPLES),
           targetOffset(0), targetLoopLen(TOTAL_SAMPLES),
           lastPlaySample(0), lastRecInput(0),
@@ -254,6 +254,13 @@ public:
                 knobUpdateCounter = 0;
                 targetOffset  = knobToSampleOffset(KnobVal(Knob::Main));
                 targetLoopLen = knobToLoopLen(KnobVal(Knob::X));
+
+                // If playhead is beyond the new loop length, restart
+                if (playPos >= targetLoopLen) {
+                    playOffset  = targetOffset;
+                    playLoopLen = targetLoopLen;
+                    playPos = 0;
+                }
             }
 
             if (tick) {
@@ -351,17 +358,17 @@ private:
     int      knobUpdateCounter;
 
 public:
-    static Pnch* s_instance;
+    static Soz* s_instance;
 };
 
-Pnch* Pnch::s_instance = nullptr;
+Soz* Soz::s_instance = nullptr;
 
 int main()
 {
     set_sys_clock_khz(192000, true);
-    Pnch p;
-    Pnch::s_instance = &p;
+    Soz p;
+    Soz::s_instance = &p;
     p.EnableNormalisationProbe();
-    multicore_launch_core1(Pnch::audioEntry);
+    multicore_launch_core1(Soz::audioEntry);
     p.flashCore();
 }
