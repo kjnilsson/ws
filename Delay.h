@@ -6,7 +6,7 @@
 
 // Tape-style mono delay with LP-filtered feedback and interpolated time changes.
 //
-// Y knob (0-4095): delay time 50 ms → 1000 ms
+// Y knob (0-4095): delay time 50 ms → 750 ms
 // Feedback fixed at 0.65 (~5 audible repeats, each progressively darker).
 //
 // Input is scaled by INPUT_GAIN (-6 dB) before entering the feedback loop so

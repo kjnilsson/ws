@@ -2,18 +2,20 @@
 // for Music Thing Workshop System Computer
 //
 // RECORD  (hold Z switch DOWN):
-//   Samples Audio In 1 into an 8-bit mono buffer (~2 sec at 48 kHz).
+//   Samples Audio In 1 into an 8-bit mono buffer (~6 sec at 24 kHz).
 //   Stops when the buffer is full or the switch is released.
 //
-// PLAY  (USB MIDI, 4-voice polyphonic):
+// PLAY  (USB MIDI, 6-voice polyphonic):
 //   Connect a USB MIDI keyboard or controller (device mode).
 //   Base pitch = MIDI note 60 (C4).  Playback loops with a fixed
-//   loop point at 50 % of the recorded length (sustain-loop style:
-//   the first pass plays the whole sample, then it loops the second half).
+//   loop point at 2/3 of the recorded length (sustain-loop style:
+//   the first pass plays the whole sample, then it loops the last third).
 //
-// X KNOB:  Selects an ADSR envelope preset.
+// MAIN KNOB:  Selects an ADSR envelope preset.
 //   Left  (CCW) = short / plucky
 //   Right (CW)  = slow / sweepy
+//
+// X KNOB:  Selects sample bank (0-5).
 //
 // Y KNOB:  Delay time (Audio Out 2 only).
 //   Left  (CCW) = ~50 ms (slapback)
@@ -21,12 +23,10 @@
 //
 // OUTPUTS:
 //   Audio Out 1 = dry mix
-//   Audio Out 2 = reverb wet only
+//   Audio Out 2 = delay wet only
 //
 // LEDs:
-//   0-3  = voice 1-4 active
-//   4    = recording in progress
-//   5    = sample ready
+//   0-5  = voice activity / bank indicator
 
 #include "ComputerCard.h"
 #include "MuLawCodec.h"
@@ -481,10 +481,11 @@ public:
                 while (tud_midi_available()) {
                     uint32_t n = tud_midi_stream_read(buf, sizeof(buf));
                     uint8_t* p = buf;
-                    while (n > 0) {
+                    while (n >= 3) {
                         MIDIMsg m(p);
                         handleMIDI(m);
-                        do { ++p; --n; } while (n > 0 && !(*p & 0x80));
+                        p += 3; n -= 3;
+                        while (n > 0 && !(*p & 0x80)) { ++p; --n; }
                     }
                 }
             }
@@ -503,10 +504,11 @@ public:
             uint32_t n = tuh_midi_stream_read(dev_addr, &cable, buf, sizeof(buf));
             if (n == 0) return;
             uint8_t* p = buf;
-            while (n > 0) {
+            while (n >= 3) {
                 MIDIMsg m(p);
                 static_cast<VSS*>(ThisPtr())->handleMIDI(m);
-                do { ++p; --n; } while (n > 0 && !(*p & 0x80));
+                p += 3; n -= 3;
+                while (n > 0 && !(*p & 0x80)) { ++p; --n; }
             }
         }
     }
@@ -583,6 +585,10 @@ public:
 
         // Write all parameters first; set `active` last so the audio
         // core sees a fully-initialised voice when it picks it up.
+        // For voice re-trigger (stealing an active slot), clear active first
+        // so core 1 skips this voice while we update its fields.
+        voices[slot].active       = false;
+        __dmb();
         voices[slot].note         = note;
         voices[slot].phase        = 0;
         voices[slot].step         = step;
@@ -593,7 +599,8 @@ public:
         voices[slot].envAccum     = startEnv;
         voices[slot].state        = VS_ATTACK;
         voices[slot].age          = ++voiceAgeCtr;
-        voices[slot].active       = true;   // ← set last
+        __dmb();
+        voices[slot].active       = true;
         pendingDelayCapture = true;
 
         // CV/gate: trigger only if this note is the lowest currently held
@@ -895,13 +902,13 @@ public:
 
         if (arpTick && arpCount > 0) {
             arpIdx = (arpIdx + 1) % arpCount;
-            // 50 % chance of octave-up shift
+            // 50 % chance of octave-down shift (skipped for notes below C1)
             static uint32_t arpRand = 0xdeadbeef;
             arpRand ^= arpRand << 13;
             arpRand ^= arpRand >> 17;
             arpRand ^= arpRand << 5;
-            uint8_t arpNote = arpNotes[arpIdx] - ((arpRand & 1u) ? 12u : 0u);
-            if (arpNote > 127) arpNote = 0;   // underflow guard
+            uint8_t arpNote = arpNotes[arpIdx];
+            if ((arpRand & 1u) && arpNote >= 24u) arpNote -= 12u;
             CVOut2MIDINote(arpNote);
             PulseOut2(true);
             arpGateTimer = ARP_GATE_LEN;
