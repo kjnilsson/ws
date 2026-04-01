@@ -220,15 +220,15 @@ struct MIDIMsg {
 class VSS : public ComputerCard
 {
 public:
-    VSS() : recording(false), writeHead(0), recordDecimate(0), presetIdx(0),
-            prevSwitchDown(true), prevSwitchUp(false),
-            loopStartPt(0), isUSBMIDIHost(false), savedToFlash(false),
-            pendingDelayCapture(false), delayKnobY(0),
+    VSS() : flashPending(false), bankIdx(0), pendingBank(0),
+            recording(false), prevSwitchDown(true), prevSwitchUp(false),
+            savedToFlash(false), isUSBMIDIHost(false),
+            writeHead(0), recordDecimate(0), presetIdx(0), presetFlashTimer(0),
+            loopStartPt(0), pendingDelayCapture(false), delayKnobY(0),
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false), cvGateNote(0),
-            flashPending(false), bankIdx(0), pendingBank(0),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0),
-            presetFlashTimer(0), tunerCounter(0)
+            tunerCounter(0)
     {
     }
 
@@ -316,8 +316,10 @@ public:
 
         // 5 rapid blinks = save entered.
         for (int b = 0; b < 5; b++) {
-            for (int i = 0; i < 6; i++) LedOn(i, true);  sleep_ms(100);
-            for (int i = 0; i < 6; i++) LedOn(i, false); sleep_ms(100);
+            for (int i = 0; i < 6; i++) LedOn(i, true);
+            sleep_ms(100);
+            for (int i = 0; i < 6; i++) LedOn(i, false);
+            sleep_ms(100);
         }
 
         if (len <= 0) {
