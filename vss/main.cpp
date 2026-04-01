@@ -51,7 +51,6 @@ static Delay delay;
 //   sustain   0 = silent  …  255 = full level
 // ===========================================================
 struct ADSRPreset {
-    const char* name;
     uint32_t attack_ms;
     uint32_t decay_ms;
     uint8_t  sustain;       // 0-255
@@ -59,18 +58,18 @@ struct ADSRPreset {
 };
 
 static const ADSRPreset PRESETS[] = {
-//   Name             Att    Dec   Sus   Rel
-    { "Pluck",           5,    80,   0,    50 },
-    { "Clavinet",        2,    50,   0,    30 },
-    { "Marimba",         2,   200,   0,   100 },
-    { "Piano",           5,   500,  50,   300 },
-    { "Harpsichord",     2,   900,   0,   120 },
-    { "Organ",           5,     0, 255,    30 },
-    { "Strings",       150,   300, 210,   700 },
-    { "Pad",           500,   800, 225,  1500 },
-    { "Choir",         350,   500, 230,  1800 },
-    { "Slow Sweep",   1200,  2500, 210,  4000 },
-    { "Rhubarb",       800,  1000, 245,  7000 },
+//              Att    Dec   Sus   Rel
+    /*Pluck*/  {   5,    80,   0,    50 },
+    /*Clav*/   {   2,    50,   0,    30 },
+    /*Marimba*/{   2,   200,   0,   100 },
+    /*Piano*/  {   5,   500,  50,   300 },
+    /*Harpsi*/ {   2,   900,   0,   120 },
+    /*Organ*/  {   5,     0, 255,    30 },
+    /*Strings*/{  150,  300, 210,   700 },
+    /*Pad*/    {  500,  800, 225,  1500 },
+    /*Choir*/  {  350,  500, 230,  1800 },
+    /*Sweep*/  { 1200, 2500, 210,  4000 },
+    /*Rhubarb*/{ 800,  1000, 245,  7000 },
 };
 
 static const int NUM_PRESETS = (int)(sizeof(PRESETS) / sizeof(PRESETS[0]));
@@ -117,7 +116,6 @@ static uint32_t flashConfigOffset() {
 
 static uint8_t sampleBuffer[BUFFER_SIZE] __attribute__((aligned(4)));
 static volatile int  sampleLen  = 0;
-static volatile bool hasSample  = false;
 
 static const int BASE_NOTE = 60;   // MIDI C4 = 1 : 1 playback speed
 
@@ -240,7 +238,6 @@ public:
     {
         // Clear sample state first — if the load fails the bank is treated as empty.
         sampleLen    = 0;
-        hasSample    = false;
         savedToFlash = false;
 
         const uint8_t* meta = (const uint8_t*)(XIP_BASE + flashMetaOffset(bank));
@@ -263,7 +260,6 @@ public:
 
         sampleLen    = len;
         loopStartPt  = lsp;
-        hasSample    = true;
         savedToFlash = true;
     }
 
@@ -324,7 +320,7 @@ public:
             for (int i = 0; i < 6; i++) LedOn(i, false); sleep_ms(100);
         }
 
-        if (len <= 0 || !hasSample) {
+        if (len <= 0) {
             for (int b = 0; b < 3; b++) {
                 LedOn(0, true); sleep_ms(250); LedOn(0, false); sleep_ms(250);
             }
@@ -480,13 +476,7 @@ public:
                 tud_task();
                 while (tud_midi_available()) {
                     uint32_t n = tud_midi_stream_read(buf, sizeof(buf));
-                    uint8_t* p = buf;
-                    while (n >= 3) {
-                        MIDIMsg m(p);
-                        handleMIDI(m);
-                        p += 3; n -= 3;
-                        while (n > 0 && !(*p & 0x80)) { ++p; --n; }
-                    }
+                    parseMIDI(buf, n);
                 }
             }
         }
@@ -503,13 +493,18 @@ public:
         while (true) {
             uint32_t n = tuh_midi_stream_read(dev_addr, &cable, buf, sizeof(buf));
             if (n == 0) return;
-            uint8_t* p = buf;
-            while (n >= 3) {
-                MIDIMsg m(p);
-                static_cast<VSS*>(ThisPtr())->handleMIDI(m);
-                p += 3; n -= 3;
-                while (n > 0 && !(*p & 0x80)) { ++p; --n; }
-            }
+            static_cast<VSS*>(ThisPtr())->parseMIDI(buf, n);
+        }
+    }
+
+    void parseMIDI(uint8_t* buf, uint32_t n)
+    {
+        uint8_t* p = buf;
+        while (n >= 3) {
+            MIDIMsg m(p);
+            handleMIDI(m);
+            p += 3; n -= 3;
+            while (n > 0 && !(*p & 0x80)) { ++p; --n; }
         }
     }
 
@@ -664,7 +659,6 @@ public:
                 }
                 writeHead    = 0;
                 sampleLen    = 0;
-                hasSample    = false;
                 loopStartPt  = 0;
                 savedToFlash = false;   // new recording invalidates any previous save
                 recording    = true;
@@ -677,7 +671,6 @@ public:
             } else if (recording) {
                 // Buffer full: finish recording (guard prevents re-entry each tick)
                 sampleLen = writeHead;
-                hasSample = true;
                 recording = false;
                 computeLoopStart();
             }
@@ -685,9 +678,8 @@ public:
             if (recording) {
                 // Switch released: finish recording
                 sampleLen = writeHead;
-                hasSample = (writeHead > 0);
                 recording = false;
-                if (hasSample) computeLoopStart();
+                if (sampleLen > 0) computeLoopStart();
             }
         }
 
@@ -713,7 +705,7 @@ public:
         }
 
         // --- Save to flash ---
-        if (switchJustUp && hasSample && !savedToFlash) {
+        if (switchJustUp && sampleLen > 0 && !savedToFlash) {
             pendingBank  = bankIdx;   // lock in the bank now, not when saveToFlash runs
             flashPending = true;
         }
