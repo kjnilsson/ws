@@ -548,14 +548,11 @@ public:
         uint8_t  rShift   = releaseShiftFn(p.release_ms);
 
         // Voice selection priority:
-        //   1. Any free (inactive / idle) voice          → envelope starts at 0
-        //   2. Same-note voice in release phase           → envelope starts from current level
-        //   3. Same-note voice in any other active state  → envelope starts at 0
-        //   4. Oldest active voice (voice steal)          → envelope starts from current
-        //      level if it happens to be in release, else 0
-        int freeSlot      = -1;
-        int sameReleasing = -1;
-        int sameActive    = -1;
+        //   1. Same-note voice (any state)       → envelope starts from current level
+        //   2. Any free (inactive / idle) voice  → envelope starts at 0
+        //   3. Oldest active voice (voice steal) → envelope starts from current level
+        int freeSlot = -1;
+        int sameNote = -1;
         uint32_t oldestAge = UINT32_MAX;
         int      oldest    = 0;
 
@@ -564,24 +561,16 @@ public:
                 if (freeSlot < 0) freeSlot = i;
                 continue;
             }
-            if (voices[i].note == note) {
-                if (voices[i].state == VS_RELEASE) sameReleasing = i;
-                else                               sameActive    = i;
-            }
+            if (voices[i].note == note && sameNote < 0) sameNote = i;
             if (voices[i].age < oldestAge) { oldestAge = voices[i].age; oldest = i; }
         }
 
-        int  slot            = -1;
-        bool startFromCurrent = false;
-        if      (freeSlot      >= 0) { slot = freeSlot; }
-        else if (sameReleasing >= 0) { slot = sameReleasing; startFromCurrent = true; }
-        else if (sameActive    >= 0) { slot = sameActive; }
-        else {
-            slot = oldest;
-            startFromCurrent = (voices[slot].state == VS_RELEASE);
-        }
+        int slot;
+        if      (sameNote >= 0) slot = sameNote;
+        else if (freeSlot >= 0) slot = freeSlot;
+        else                    slot = oldest;
 
-        uint32_t startEnv = startFromCurrent ? voices[slot].envAccum : 0u;
+        uint32_t startEnv = (slot != freeSlot) ? voices[slot].envAccum : 0u;
 
         // Write all parameters first; set `active` last so the audio
         // core sees a fully-initialised voice when it picks it up.

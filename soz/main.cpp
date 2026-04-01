@@ -63,6 +63,13 @@ static volatile bool recording;
 static volatile bool recPending;
 static volatile int  recMix;
 
+// Wrap a sample index into [0, TOTAL_SAMPLES) without division.
+static inline uint32_t wrapSample(uint32_t s)
+{
+    if (s >= TOTAL_SAMPLES) s -= TOTAL_SAMPLES;
+    return s;
+}
+
 // Read a sample from flash given an absolute sample index (24 kHz domain).
 static inline int16_t readFlashSample(uint32_t sampleIdx)
 {
@@ -206,6 +213,7 @@ public:
 
                 int16_t* dst = (int16_t*)(sectorBuf[writeBank]);
                 dst[sectorSampleIdx] = (int16_t)mixed;
+                lastPlaySample = existing;
 
                 if (++sectorSampleIdx >= SAMPLES_PER_SECTOR) {
                     if (flushBank < 0) {
@@ -219,7 +227,7 @@ public:
             }
 
             AudioOut1(input);
-            AudioOut2(input);
+            AudioOut2(lastPlaySample);
 
             int ledIdx = (writeSectorIdx * 5) / (int)FLASH_REGION_SECTORS;
             for (int i = 0; i < 5; i++) LedOn(i, i == ledIdx);
@@ -273,13 +281,13 @@ public:
                     pos = 0;
                 }
 
-                uint32_t absSample = (playOffset + pos) % TOTAL_SAMPLES;
+                uint32_t absSample = wrapSample(playOffset + pos);
                 int16_t smp = readFlashSample(absSample);
 
                 // Crossfade at loop boundary
                 if (playLoopLen > (uint32_t)(XFADE_LEN * 2) && pos >= playLoopLen - XFADE_LEN) {
                     uint32_t xOff = pos - (playLoopLen - XFADE_LEN);
-                    uint32_t headSample = (playOffset + xOff) % TOTAL_SAMPLES;
+                    uint32_t headSample = wrapSample(playOffset + xOff);
                     int16_t smp2 = readFlashSample(headSample);
                     int fade = (int)(xOff * 256 / XFADE_LEN);
                     smp = (int16_t)(smp + (((smp2 - smp) * fade) >> 8));
@@ -304,7 +312,7 @@ public:
         playLoopLen   = targetLoopLen;
 
         AudioOut1(0);
-        AudioOut2(0);
+        AudioOut2(input);
 
         int ledIdx = (int)((uint64_t)cursorSample * 6 / TOTAL_SAMPLES);
         if (ledIdx > 5) ledIdx = 5;

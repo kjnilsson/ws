@@ -31,6 +31,7 @@ add_example(umel)
 add_example(tnr)
 add_example(nzt)
 add_example(seq6)
+add_example(dr8)
 
 add_example(soz)
 target_link_libraries(soz pico_multicore hardware_flash)
