@@ -590,13 +590,13 @@ public:
         uint32_t dRate    = decayRateFn(p.decay_ms, swing);
         uint8_t  rShift   = releaseShiftFn(p.release_ms);
 
-        // If the same note is already playing, send it into a fast release
-        // so it fades out naturally while the new voice starts fresh.
+        // If the same note is already sounding (held or releasing), send it
+        // into a fast release so it fades out while the new voice starts fresh.
         for (int i = 0; i < NUM_VOICES; i++) {
             if (voices[i].active && voices[i].note == note &&
-                voices[i].state != VS_RELEASE && voices[i].state != VS_IDLE)
+                voices[i].state != VS_IDLE)
             {
-                voices[i].releaseShift = 2;   // very fast exponential release (~1 ms)
+                voices[i].releaseShift = 14;   // fast exponential release (~2.7 ms)
                 voices[i].state        = VS_RELEASE;
             }
         }
