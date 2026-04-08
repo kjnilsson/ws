@@ -129,6 +129,19 @@ static const int BASE_NOTE = 60;   // MIDI C4 = 1 : 1 playback speed
 // Rates are in Q8 units / sample (256 = advance 1 level unit / sample).
 // This supports times from ~0.02 ms up to ~5 seconds accurately.
 // ===========================================================
+// Pitch bend lookup table: 257 entries covering ±2 semitones, Q16 fixed-point.
+// Index 0 = -2 semitones, 128 = center (65536), 256 = +2 semitones.
+// 14-bit MIDI bend (-8192..+8191) maps to index via (bend + 8192) >> 6.
+static uint32_t bendTable[257];
+
+static void initBendTable()
+{
+    for (int i = 0; i <= 256; i++) {
+        float semis = (float)(i - 128) * (2.0f / 128.0f);
+        bendTable[i] = (uint32_t)(65536.0f * powf(2.0f, semis / 12.0f));
+    }
+}
+
 static const uint32_t ENV_TOP = 65535u * 256u;   // max envAccum value
 static const uint32_t ENV_MAX = 65535u;           // max level (= ENV_TOP >> 8)
 
@@ -198,17 +211,19 @@ static volatile uint32_t voiceAgeCtr = 0;
 // MIDI message parser
 // ===========================================================
 struct MIDIMsg {
-    enum Cmd { Unknown = 0, NoteOn = 0x90, NoteOff = 0x80 };
+    enum Cmd { Unknown = 0, NoteOn = 0x90, NoteOff = 0x80, PitchBend = 0xE0 };
     Cmd     cmd;
     uint8_t note, vel;
+    int16_t bend;       // -8192 .. +8191 (14-bit centered)
 
     uint8_t channel;  // 1-16
 
-    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0),
+    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0), bend(0),
                                    channel((p[0] & 0x0F) + 1) {
         switch (p[0] & 0xF0) {
-        case 0x90: cmd = NoteOn;  note = p[1]; vel = p[2]; break;
-        case 0x80: cmd = NoteOff; note = p[1]; vel = p[2]; break;
+        case 0x90: cmd = NoteOn;   note = p[1]; vel = p[2]; break;
+        case 0x80: cmd = NoteOff;  note = p[1]; vel = p[2]; break;
+        case 0xE0: cmd = PitchBend; bend = (int16_t)(((p[2] << 7) | p[1]) - 8192); break;
         default: break;
         }
     }
@@ -226,6 +241,7 @@ public:
             writeHead(0), recordDecimate(0), presetIdx(0), presetFlashTimer(0),
             loopStartPt(0), pendingDelayCapture(false), delayKnobY(0),
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false), cvGateNote(0),
+            bendMult(65536u),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0),
             tunerCounter(0)
@@ -520,6 +536,9 @@ public:
         else if (m.cmd == MIDIMsg::NoteOff ||
                  (m.cmd == MIDIMsg::NoteOn && m.vel == 0))
             noteOff(m.note);
+        else if (m.cmd == MIDIMsg::PitchBend) {
+            bendMult = bendTable[((int)m.bend + 8192) >> 6];
+        }
     }
 
     void noteOn(uint8_t note)
@@ -731,8 +750,8 @@ public:
             for (int i = 0; i < NUM_VOICES; i++) {
                 if (!voices[i].active) continue;
 
-                // Advance playback position (Q8)
-                voices[i].phase += voices[i].step;
+                // Advance playback position (Q8), applying pitch bend
+                voices[i].phase += (voices[i].step * bendMult) >> 16;
                 int pos = (int)(voices[i].phase >> 8);
 
                 // Loop wrap: land at wrapTarget so we're past the faded-in head
@@ -962,6 +981,7 @@ private:
     volatile uint8_t pendingCVNote;
     bool             gateState;
     uint8_t          cvGateNote;    // note currently committed to CV Out 1 / Gate Out 1
+    volatile uint32_t bendMult;    // Q16 pitch bend multiplier (65536 = no bend)
 
     // Arpeggiator
     int  arpIdx;        // current note index (-1 = reset)
@@ -1021,6 +1041,7 @@ void tuh_midi_tx_cb(uint8_t dev_addr) { (void)dev_addr; }
 int main()
 {
     set_sys_clock_khz(192000, true);   // 192 MHz = 48 kHz × 4000 — clean audio clock multiple
+    initBendTable();
     VSS vss;
     VSS::s_instance = &vss;   // audioEntry() needs this before Run() sets thisptr
     vss.EnableNormalisationProbe();   // must be before Run() (called inside audioEntry)
