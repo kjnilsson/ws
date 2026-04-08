@@ -280,8 +280,8 @@ public:
         if (computedXor != storedXor) return;   // data corrupted
 
         sampleLen    = len;
-        loopStartPt  = lsp;
         savedToFlash = true;
+        computeLoopStart();   // recompute for best crossfade match
     }
 
     // ---- Config load/save/mode -----------------------------------------
@@ -662,26 +662,45 @@ public:
 
     }
 
-    // Find the nearest upward zero crossing to sampleLen/2 and store it in
-    // loopStartPt.  Called once after each recording ends — blocking for a
-    // few hundred µs is inaudible because all voices are silent at that point.
+    // Find the loop start point that gives the smoothest crossfade.
+    //
+    // The crossfade blends sampleBuffer[len-XFADE_LEN..len-1] (tail) into
+    // sampleBuffer[loopStart..loopStart+XFADE_LEN-1] (head).  We search
+    // candidates near the 2/3 mark and pick the one where the head region
+    // best matches the tail region (lowest sum-of-squared-differences).
+    //
+    // Called once after recording ends or after loading from flash.
+    // Blocking for a few ms is fine — no voices are playing at that point.
     void computeLoopStart()
     {
-        int len     = sampleLen;
+        int len = sampleLen;
+        if (len < XFADE_LEN * 3) { loopStartPt = (len * 2) / 3; return; }
+
         int nominal = (len * 2) / 3;
-        int lo = nominal - XFADE_LEN;  if (lo < 1)    lo = 1;
-        int hi = nominal + XFADE_LEN;  if (hi >= len) hi = len - 1;
+        int searchRadius = XFADE_LEN;
+        int lo = nominal - searchRadius;  if (lo < 1)    lo = 1;
+        int hi = nominal + searchRadius;  if (hi > len - XFADE_LEN) hi = len - XFADE_LEN;
 
-        int best     = nominal;
-        int bestDist = XFADE_LEN + 1;
+        // Precompute the tail region we're matching against
+        // (last XFADE_LEN samples before end, subsampled for speed)
+        static const int COMPARE_STEP = 8;
+        static const int COMPARE_LEN  = XFADE_LEN / COMPARE_STEP;  // 512 comparisons
+        int16_t tail[COMPARE_LEN];
+        for (int j = 0; j < COMPARE_LEN; j++)
+            tail[j] = codec.decodeSample(sampleBuffer[len - XFADE_LEN + j * COMPARE_STEP]);
 
-        for (int i = lo; i < hi; i++) {
-            if (codec.decodeSample(sampleBuffer[i - 1]) <= 0 &&
-                codec.decodeSample(sampleBuffer[i])     >  0)
-            {
-                int dist = i - nominal;  if (dist < 0) dist = -dist;
-                if (dist < bestDist) { bestDist = dist; best = i; }
+        int best = nominal;
+        uint32_t bestErr = UINT32_MAX;
+
+        for (int cand = lo; cand < hi; cand++) {
+            uint32_t err = 0;
+            for (int j = 0; j < COMPARE_LEN; j++) {
+                int16_t head = codec.decodeSample(sampleBuffer[cand + j * COMPARE_STEP]);
+                int diff = head - tail[j];
+                err += (uint32_t)(diff * diff);
+                if (err >= bestErr) break;   // early out
             }
+            if (err < bestErr) { bestErr = err; best = cand; }
         }
         loopStartPt = best;
     }
