@@ -196,12 +196,13 @@ struct Voice {
     volatile uint8_t     releaseShift; // exponential release: envAccum -= envAccum >> releaseShift
     volatile VoiceState  state;
     volatile uint32_t    age;          // voice-stealing: larger = older
+    volatile uint32_t    lfoPhase;     // per-voice vibrato LFO phase
 
     Voice()
         : active(false), note(0), phase(0), step(256u),
           envAccum(0), attackRate(1u), decayRate(1u),
           sustainAccum(0), releaseShift(8u),
-          state(VS_IDLE), age(0) {}
+          state(VS_IDLE), age(0), lfoPhase(0) {}
 };
 
 static Voice   voices[NUM_VOICES];
@@ -211,18 +212,20 @@ static volatile uint32_t voiceAgeCtr = 0;
 // MIDI message parser
 // ===========================================================
 struct MIDIMsg {
-    enum Cmd { Unknown = 0, NoteOn = 0x90, NoteOff = 0x80, PitchBend = 0xE0 };
+    enum Cmd { Unknown = 0, NoteOn = 0x90, NoteOff = 0x80, CC = 0xB0, PitchBend = 0xE0 };
     Cmd     cmd;
     uint8_t note, vel;
+    uint8_t cc, ccVal;  // CC number and value
     int16_t bend;       // -8192 .. +8191 (14-bit centered)
 
     uint8_t channel;  // 1-16
 
-    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0), bend(0),
+    explicit MIDIMsg(uint8_t* p) : cmd(Unknown), note(0), vel(0), cc(0), ccVal(0), bend(0),
                                    channel((p[0] & 0x0F) + 1) {
         switch (p[0] & 0xF0) {
-        case 0x90: cmd = NoteOn;   note = p[1]; vel = p[2]; break;
-        case 0x80: cmd = NoteOff;  note = p[1]; vel = p[2]; break;
+        case 0x90: cmd = NoteOn;    note = p[1]; vel = p[2]; break;
+        case 0x80: cmd = NoteOff;   note = p[1]; vel = p[2]; break;
+        case 0xB0: cmd = CC;        cc = p[1]; ccVal = p[2]; break;
         case 0xE0: cmd = PitchBend; bend = (int16_t)(((p[2] << 7) | p[1]) - 8192); break;
         default: break;
         }
@@ -241,9 +244,9 @@ public:
             writeHead(0), recordDecimate(0), presetIdx(0), presetFlashTimer(0),
             loopStartPt(0), pendingDelayCapture(false), delayKnobY(0),
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false), cvGateNote(0),
-            bendMult(65536u),
+            bendMult(65536u), modWheel(0), lfoInc(0), vibratoRate(64),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
-            midiChannel(0), inConfigMode(false), configMidiChan(0),
+            midiChannel(0), inConfigMode(false), configMidiChan(0), configVibRate(64),
             tunerCounter(0)
     {
     }
@@ -281,13 +284,28 @@ public:
 
     // ---- Config load/save/mode -----------------------------------------
 
+    // Convert vibrato rate byte (0-255) to LFO phase increment.
+    // Maps to ~2-10 Hz:  hz = 2 + byte * 8 / 255 ≈ 2 + byte / 32
+    void updateVibratoRate(uint8_t rateByte)
+    {
+        vibratoRate = rateByte;
+        float hz = 2.0f + (float)rateByte * (8.0f / 255.0f);
+        lfoInc = (uint32_t)(hz * (4294967296.0f / (float)SAMPLE_RATE));
+    }
+
     void loadConfig()
     {
         const uint8_t* p = (const uint8_t*)(XIP_BASE + flashConfigOffset());
         uint32_t magic; memcpy(&magic, p, 4);
-        if (magic != FLASH_CONFIG_MAGIC) { midiChannel = 0; return; }
+        if (magic != FLASH_CONFIG_MAGIC) {
+            midiChannel = 0;
+            updateVibratoRate(64);   // default ~4 Hz
+            return;
+        }
         midiChannel = p[4];
         if (midiChannel > 16) midiChannel = 0;
+        uint8_t vr = p[5];
+        updateVibratoRate(vr == 0xFF ? 64 : vr);   // 0xFF = unprogrammed → default
     }
 
     void saveConfig()
@@ -297,6 +315,7 @@ public:
         uint32_t magic = FLASH_CONFIG_MAGIC;
         memcpy(cfgPage, &magic, 4);
         cfgPage[4] = midiChannel;
+        cfgPage[5] = vibratoRate;
 
         multicore_lockout_start_blocking();
         uint32_t ints = save_and_disable_interrupts();
@@ -314,12 +333,15 @@ public:
     {
         inConfigMode = true;
         while (SwitchVal() == Switch::Down) {
-            // Map Main knob 0-4095 to channel 0-16 (0 = omni)
+            // Main knob: MIDI channel 0-16 (0 = omni)
             configMidiChan = (uint8_t)((KnobVal(Knob::Main) * 17) >> 12);
+            // X knob: vibrato rate 0-255
+            configVibRate = (uint8_t)(KnobVal(Knob::X) >> 4);
             sleep_ms(10);
         }
-        midiChannel    = configMidiChan;
-        inConfigMode   = false;
+        midiChannel = configMidiChan;
+        updateVibratoRate(configVibRate);
+        inConfigMode = false;
         saveConfig();
     }
 
@@ -536,6 +558,9 @@ public:
         else if (m.cmd == MIDIMsg::NoteOff ||
                  (m.cmd == MIDIMsg::NoteOn && m.vel == 0))
             noteOff(m.note);
+        else if (m.cmd == MIDIMsg::CC && m.cc == 1) {
+            modWheel = m.ccVal;
+        }
         else if (m.cmd == MIDIMsg::PitchBend) {
             bendMult = bendTable[((int)m.bend + 8192) >> 6];
         }
@@ -602,6 +627,7 @@ public:
         voices[slot].decayRate    = dRate;
         voices[slot].releaseShift = rShift;
         voices[slot].envAccum     = startEnv;
+        voices[slot].lfoPhase     = 0;
         voices[slot].state        = VS_ATTACK;
         voices[slot].age          = ++voiceAgeCtr;
         __dmb();
@@ -747,11 +773,24 @@ public:
             int  wrapTarget   = canXfade ? loopStart + XFADE_LEN : loopStart;
             int  wrapLoopLen  = len - wrapTarget;
 
+            uint8_t mw = modWheel;
+            uint32_t li = lfoInc;
+
             for (int i = 0; i < NUM_VOICES; i++) {
                 if (!voices[i].active) continue;
 
-                // Advance playback position (Q8), applying pitch bend
-                voices[i].phase += (voices[i].step * bendMult) >> 16;
+                // Per-voice vibrato LFO (triangle wave, ±0.5 semitones at full mod)
+                uint32_t s = (voices[i].step * bendMult) >> 16;
+                if (mw > 0) {
+                    voices[i].lfoPhase += li;
+                    uint32_t tri = (voices[i].lfoPhase < 0x80000000u)
+                        ? (voices[i].lfoPhase >> 15)
+                        : ((0xFFFFFFFFu - voices[i].lfoPhase) >> 15);
+                    int32_t lfo = (int32_t)tri - 32768;
+                    int32_t vibOffset = ((lfo >> 8) * (int32_t)mw * 15) >> 7;
+                    s = (s * (uint32_t)((int32_t)65536 + vibOffset)) >> 16;
+                }
+                voices[i].phase += s;
                 int pos = (int)(voices[i].phase >> 8);
 
                 // Loop wrap: land at wrapTarget so we're past the faded-in head
@@ -982,6 +1021,9 @@ private:
     bool             gateState;
     uint8_t          cvGateNote;    // note currently committed to CV Out 1 / Gate Out 1
     volatile uint32_t bendMult;    // Q16 pitch bend multiplier (65536 = no bend)
+    volatile uint8_t  modWheel;   // CC1 value (0-127), set by MIDI core
+    volatile uint32_t lfoInc;     // LFO phase increment per sample
+    uint8_t           vibratoRate; // 0-255, persisted in flash config
 
     // Arpeggiator
     int  arpIdx;        // current note index (-1 = reset)
@@ -993,6 +1035,7 @@ private:
     uint8_t          midiChannel;     // 0 = omni, 1-16 = specific channel
     volatile bool    inConfigMode;    // tells ProcessSample to show config LEDs
     volatile uint8_t configMidiChan;  // channel being dialled in during config mode
+    volatile uint8_t configVibRate;   // vibrato rate being dialled in during config mode
 
     // Tuner (active when Audio In 2 is connected)
     PitchDetector tunerPd;
