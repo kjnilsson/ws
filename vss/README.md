@@ -15,7 +15,7 @@ VSS stores up to 6 independent samples in flash (banks 0–5). The X knob select
 
 Hold the **Z switch down while powering on** (or reloading the card). After ~150 ms the module enters configuration mode, indicated by LED 5 blinking slowly.
 
-Turn the **Main knob** to select the MIDI receive channel. Release the switch to save and exit.
+Turn the **Main knob** to select the MIDI receive channel. Turn the **X knob** to set the vibrato rate (2–10 Hz, used with the mod wheel). Release the switch to save and exit.
 
 | LEDs 0–4 | MIDI channel |
 |----------|-------------|
@@ -54,6 +54,8 @@ Connect a USB MIDI keyboard or controller. The module auto-detects whether it is
 
 - **Base pitch**: MIDI note 60 (C4) plays the sample at its recorded pitch.
 - **Polyphony**: up to 6 simultaneous voices.
+- **Pitch bend**: ±2 semitones, applied to all sounding voices.
+- **Mod wheel** (CC1): per-voice vibrato (±0.5 semitones, triangle LFO). Each voice's LFO restarts on note-on. The vibrato rate is set in configuration mode (default ~4 Hz).
 - **Loop**: after the first full pass, playback loops the second half of the sample with a short crossfade at the loop point to avoid clicks.
 - **CV Out 1 / Gate Out 1**: tracks the lowest currently held note for use with an analogue voice.
 

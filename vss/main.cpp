@@ -10,6 +10,8 @@
 //   Base pitch = MIDI note 60 (C4).  Playback loops with a fixed
 //   loop point at 2/3 of the recorded length (sustain-loop style:
 //   the first pass plays the whole sample, then it loops the last third).
+//   Pitch bend ±2 semitones.  Mod wheel (CC1) adds per-voice vibrato
+//   (±0.5 semitones, triangle LFO, rate set in config mode).
 //
 // MAIN KNOB:  Selects an ADSR envelope preset.
 //   Left  (CCW) = short / plucky
@@ -588,12 +590,19 @@ public:
         uint32_t dRate    = decayRateFn(p.decay_ms, swing);
         uint8_t  rShift   = releaseShiftFn(p.release_ms);
 
-        // Voice selection priority:
-        //   1. Same-note voice (any state)       → envelope starts from current level
-        //   2. Any free (inactive / idle) voice  → envelope starts at 0
-        //   3. Oldest active voice (voice steal) → envelope starts from current level
+        // If the same note is already playing, send it into a fast release
+        // so it fades out naturally while the new voice starts fresh.
+        for (int i = 0; i < NUM_VOICES; i++) {
+            if (voices[i].active && voices[i].note == note &&
+                voices[i].state != VS_RELEASE && voices[i].state != VS_IDLE)
+            {
+                voices[i].releaseShift = 2;   // very fast exponential release (~1 ms)
+                voices[i].state        = VS_RELEASE;
+            }
+        }
+
+        // Voice selection: prefer a free slot, otherwise steal the oldest
         int freeSlot = -1;
-        int sameNote = -1;
         uint32_t oldestAge = UINT32_MAX;
         int      oldest    = 0;
 
@@ -602,21 +611,14 @@ public:
                 if (freeSlot < 0) freeSlot = i;
                 continue;
             }
-            if (voices[i].note == note && sameNote < 0) sameNote = i;
             if (voices[i].age < oldestAge) { oldestAge = voices[i].age; oldest = i; }
         }
 
-        int slot;
-        if      (sameNote >= 0) slot = sameNote;
-        else if (freeSlot >= 0) slot = freeSlot;
-        else                    slot = oldest;
+        int slot = (freeSlot >= 0) ? freeSlot : oldest;
+        uint32_t startEnv = (freeSlot >= 0) ? 0u : voices[slot].envAccum;
 
-        uint32_t startEnv = (slot != freeSlot) ? voices[slot].envAccum : 0u;
-
-        // Write all parameters first; set `active` last so the audio
-        // core sees a fully-initialised voice when it picks it up.
-        // For voice re-trigger (stealing an active slot), clear active first
-        // so core 1 skips this voice while we update its fields.
+        // Full init.  Clear active first so core 1 skips this voice
+        // while we update its fields.
         voices[slot].active       = false;
         __dmb();
         voices[slot].note         = note;
