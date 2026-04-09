@@ -182,7 +182,7 @@ static uint32_t decayRateFn(uint32_t ms, uint32_t swing)
 // ===========================================================
 // Polyphonic voice
 // ===========================================================
-static const int NUM_VOICES = 6;
+static const int MAX_VOICES = 6;
 
 enum VoiceState : uint8_t { VS_IDLE, VS_ATTACK, VS_DECAY, VS_SUSTAIN, VS_RELEASE };
 
@@ -207,7 +207,7 @@ struct Voice {
           state(VS_IDLE), age(0), lfoPhase(0) {}
 };
 
-static Voice   voices[NUM_VOICES];
+static Voice   voices[MAX_VOICES];
 static volatile uint32_t voiceAgeCtr = 0;
 
 // ===========================================================
@@ -250,7 +250,7 @@ public:
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
             midiClockTick(false), hasMidiClock(false), midiClockCount(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0), configVibRate(64),
-            tunerCounter(0)
+            tunerActive(false), tunerDebounce(0), tunerCounter(0)
     {
     }
 
@@ -540,16 +540,39 @@ public:
         }
     }
 
+    // Strip real-time bytes (0xF8-0xFF) from the buffer in-place and handle
+    // them immediately.  Real-time can appear anywhere — even between the
+    // status and data bytes of a channel message — so they must be removed
+    // before parsing multi-byte messages.
     void parseMIDI(uint8_t* buf, uint32_t n)
     {
+        // Pass 1: extract real-time, compact the rest
+        uint32_t out = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (buf[i] >= 0xF8) {
+                if (buf[i] == 0xF8) midiClockTick = true;
+            } else {
+                buf[out++] = buf[i];
+            }
+        }
+        n = out;
+
+        // Pass 2: parse channel / system-common messages (no real-time left)
         uint8_t* p = buf;
         while (n > 0) {
-            // System real-time messages (0xF8-0xFF) are single-byte
-            if (*p >= 0xF8) {
-                if (*p == 0xF8) midiClockTick = true;   // MIDI clock
+            // System common (0xF0-0xF7): skip (variable/unknown length)
+            if (*p >= 0xF0) {
                 ++p; --n;
+                while (n > 0 && !(*p & 0x80)) { ++p; --n; }
                 continue;
             }
+            // Program Change (0xC0) and Channel Pressure (0xD0): 2-byte messages
+            if ((*p & 0xF0) == 0xC0 || (*p & 0xF0) == 0xD0) {
+                if (n < 2) break;
+                p += 2; n -= 2;
+                continue;
+            }
+            // All other channel messages: 3 bytes
             if (n < 3) break;
             MIDIMsg m(p);
             handleMIDI(m);
@@ -598,55 +621,74 @@ public:
         uint32_t dRate    = decayRateFn(p.decay_ms, swing);
         uint8_t  rShift   = releaseShiftFn(p.release_ms);
 
-        // If the same note is already sounding (held or releasing), send it
-        // into a fast release so it fades out while the new voice starts fresh.
-        for (int i = 0; i < NUM_VOICES; i++) {
-            if (voices[i].active && voices[i].note == note &&
-                voices[i].state != VS_IDLE)
-            {
-                voices[i].releaseShift = 14;   // fast exponential release (~2.7 ms)
-                voices[i].state        = VS_RELEASE;
-            }
-        }
-
-        // Voice selection: prefer a free slot, otherwise steal the oldest
+        // Find a same-note voice and a free slot
+        int sameNote = -1;
         int freeSlot = -1;
         uint32_t oldestAge = UINT32_MAX;
         int      oldest    = 0;
 
-        for (int i = 0; i < NUM_VOICES; i++) {
+        for (int i = 0; i < MAX_VOICES; i++) {
             if (!voices[i].active || voices[i].state == VS_IDLE) {
                 if (freeSlot < 0) freeSlot = i;
                 continue;
             }
+            if (voices[i].note == note && sameNote < 0) sameNote = i;
             if (voices[i].age < oldestAge) { oldestAge = voices[i].age; oldest = i; }
         }
 
-        int slot = (freeSlot >= 0) ? freeSlot : oldest;
-        uint32_t startEnv = (freeSlot >= 0) ? 0u : voices[slot].envAccum;
+        int slot;
+        if (sameNote >= 0 && freeSlot >= 0) {
+            // Same note + free slot: release old voice naturally, start fresh
+            if (voices[sameNote].state != VS_RELEASE)
+                voices[sameNote].state = VS_RELEASE;
+            slot = freeSlot;
+        } else if (sameNote >= 0) {
+            // Same note, no free slot: update in place, keep phase continuous
+            slot = sameNote;
+            voices[slot].sustainAccum = susAccum;
+            voices[slot].attackRate   = aRate;
+            voices[slot].decayRate    = dRate;
+            voices[slot].releaseShift = rShift;
+            // envAccum kept as-is — attack resumes from current level
+            voices[slot].lfoPhase     = 0;
+            voices[slot].age          = ++voiceAgeCtr;
+            __dmb();
+            voices[slot].state        = VS_ATTACK;
+            goto voiceReady;
+        } else if (freeSlot >= 0) {
+            slot = freeSlot;
+        } else {
+            slot = oldest;
+        }
 
-        // Full init.  Clear active first so core 1 skips this voice
-        // while we update its fields.
-        voices[slot].active       = false;
-        __dmb();
-        voices[slot].note         = note;
-        voices[slot].phase        = 0;
-        voices[slot].step         = step;
-        voices[slot].sustainAccum = susAccum;
-        voices[slot].attackRate   = aRate;
-        voices[slot].decayRate    = dRate;
-        voices[slot].releaseShift = rShift;
-        voices[slot].envAccum     = startEnv;
-        voices[slot].lfoPhase     = 0;
-        voices[slot].state        = VS_ATTACK;
-        voices[slot].age          = ++voiceAgeCtr;
-        __dmb();
-        voices[slot].active       = true;
+        // Free slot or steal: full init with active=false guard to prevent
+        // the audio core from seeing a half-updated voice.
+        // Always start envelope from 0 — the active=false gap already drops
+        // the voice to silence, so ramping up from 0 is clean.  Starting from
+        // the old level would spike because sample[0] != sample[oldPos].
+        {
+            voices[slot].active       = false;
+            __dmb();
+            voices[slot].note         = note;
+            voices[slot].phase        = 0;
+            voices[slot].step         = step;
+            voices[slot].sustainAccum = susAccum;
+            voices[slot].attackRate   = aRate;
+            voices[slot].decayRate    = dRate;
+            voices[slot].releaseShift = rShift;
+            voices[slot].envAccum     = 0;
+            voices[slot].lfoPhase     = 0;
+            voices[slot].age          = ++voiceAgeCtr;
+            __dmb();
+            voices[slot].state        = VS_ATTACK;
+            voices[slot].active       = true;
+        }
+    voiceReady:
         pendingDelayCapture = true;
 
         // CV/gate: trigger only if this note is the lowest currently held
         uint8_t lowest = 127;
-        for (int i = 0; i < NUM_VOICES; i++) {
+        for (int i = 0; i < MAX_VOICES; i++) {
             if (voices[i].active &&
                 voices[i].state != VS_RELEASE && voices[i].state != VS_IDLE &&
                 voices[i].note < lowest)
@@ -660,7 +702,7 @@ public:
 
     void noteOff(uint8_t note)
     {
-        for (int i = 0; i < NUM_VOICES; i++) {
+        for (int i = 0; i < MAX_VOICES; i++) {
             if (voices[i].active && voices[i].note == note &&
                 voices[i].state != VS_RELEASE && voices[i].state != VS_IDLE)
             {
@@ -717,8 +759,8 @@ public:
 
     virtual void ProcessSample() override
     {
-        bool tunerMode = Connected(Input::Audio2);
-        if (tunerMode) tunerPd.addSample(AudioIn1());
+        // Tuner mode disabled (normalisation probe removed).
+        bool tunerMode = false;
 
         // --- Recording (Z switch Down = momentary press) ---
         Switch sw = SwitchVal();
@@ -729,7 +771,7 @@ public:
         if (switchDown) {
             if (switchJustPressed && !recording) {
                 // New recording: silence all voices and reset buffer
-                for (int i = 0; i < NUM_VOICES; i++) {
+                for (int i = 0; i < MAX_VOICES; i++) {
                     voices[i].active = false;
                     voices[i].state  = VS_IDLE;
                 }
@@ -805,7 +847,7 @@ public:
             uint8_t mw = modWheel;
             uint32_t li = lfoInc;
 
-            for (int i = 0; i < NUM_VOICES; i++) {
+            for (int i = 0; i < MAX_VOICES; i++) {
                 if (!voices[i].active) continue;
 
                 // Per-voice vibrato LFO (triangle wave, ±0.5 semitones at full mod)
@@ -875,15 +917,16 @@ public:
                     break;
 
                 case VS_RELEASE: {
-                    uint32_t drop = voices[i].envAccum >> voices[i].releaseShift;
-                    if (drop == 0) drop = 1;   // ensure termination at very low levels
-                    if (voices[i].envAccum > drop) {
-                        voices[i].envAccum -= drop;
-                    } else {
+                    // Kill voice once envelope is inaudible (level < 2 in 16-bit range)
+                    if (voices[i].envAccum < 512u) {
                         voices[i].envAccum = 0;
                         voices[i].active   = false;
                         voices[i].state    = VS_IDLE;
+                        break;
                     }
+                    uint32_t drop = voices[i].envAccum >> voices[i].releaseShift;
+                    if (drop == 0) drop = 1;
+                    voices[i].envAccum -= drop;
                     break;
                 }
 
@@ -897,7 +940,6 @@ public:
                 mix += ((int32_t)smp * (int32_t)level) >> 16;
             }
 
-            // Divide by 8 (next power of 2 above 6 voices) to stay in 12-bit range
             mix >>= 3;
         }
 
@@ -905,8 +947,7 @@ public:
         if (mix >  2047) mix =  2047;
         if (mix < -2048) mix = -2048;
 
-        // Audio Out 1: passthrough of Audio In 1 in tuner mode; dry voice mix otherwise.
-        AudioOut1(tunerMode ? AudioIn1() : (int16_t)mix);
+        AudioOut1((int16_t)mix);
 
         // CV Out 1 / Gate Out 1:
         //   In tuner mode: CV Out 1 = middle C reference (gate unused).
@@ -925,7 +966,7 @@ public:
             pendingCVNoteOn = false;
         } else if (gateState) {
             bool noteStillPlaying = false;
-            for (int i = 0; i < NUM_VOICES; i++)
+            for (int i = 0; i < MAX_VOICES; i++)
                 if (voices[i].active && voices[i].note == cvGateNote
                     && voices[i].state != VS_RELEASE)
                     { noteStillPlaying = true; break; }
@@ -941,9 +982,9 @@ public:
 
         // --- Arpeggiator (CV Out 2 / Gate Out 2) ---
         // Collect held notes (active, non-releasing) into a sorted list
-        uint8_t arpNotes[NUM_VOICES];
+        uint8_t arpNotes[MAX_VOICES];
         int     arpCount = 0;
-        for (int i = 0; i < NUM_VOICES; i++) {
+        for (int i = 0; i < MAX_VOICES; i++) {
             if (!voices[i].active ||
                 voices[i].state == VS_RELEASE ||
                 voices[i].state == VS_IDLE) continue;
@@ -1009,7 +1050,7 @@ public:
         } else if (recording) {
             for (int i = 0; i < 6; i++) LedOn(i, true);
         } else {
-            for (int i = 0; i < NUM_VOICES; i++) {
+            for (int i = 0; i < MAX_VOICES; i++) {
                 if (tunerMode && (i == 0 || i == 2 || i == 4)) continue;
                 if (i == 5 && presetFlashTimer > 0) {
                     LedOn(5, true);
@@ -1079,6 +1120,10 @@ private:
     volatile uint8_t configVibRate;   // vibrato rate being dialled in during config mode
 
     // Tuner (active when Audio In 2 is connected)
+    bool          tunerActive;        // debounced tuner mode state
+    int           tunerDebounce;      // leaky integrator for tuner detection
+    static constexpr int TUNER_DEBOUNCE_HIGH = 24000;  // 0.5 s to enter tuner mode
+    static constexpr int TUNER_DEBOUNCE_LOW  = 2400;   // 50 ms to exit tuner mode
     PitchDetector tunerPd;
     uint8_t       tunerCounter;      // wraps every 256 samples for display update
 
@@ -1128,7 +1173,9 @@ int main()
     initBendTable();
     VSS vss;
     VSS::s_instance = &vss;   // audioEntry() needs this before Run() sets thisptr
-    vss.EnableNormalisationProbe();   // must be before Run() (called inside audioEntry)
+    // Normalisation probe disabled — it causes 512-sample glitches on Audio Out 1
+    // when Audio In 1 is connected (probe falsely detects Audio In 2 as connected,
+    // momentarily enabling tuner mode passthrough).
     // Audio on core 1 (lockout victim); USB + flash save on core 0 (main thread).
     // This matches the reverb card architecture: flash ops happen from the non-ISR
     // core so multicore_lockout_start_blocking() is safe to call.
