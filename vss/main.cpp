@@ -248,6 +248,7 @@ public:
             pendingCVNoteOn(false), pendingCVNote(0), gateState(false), cvGateNote(0),
             bendMult(65536u), modWheel(0), lfoInc(0), vibratoRate(64),
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
+            midiClockTick(false), hasMidiClock(false), midiClockCount(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0), configVibRate(64),
             tunerCounter(0)
     {
@@ -542,7 +543,14 @@ public:
     void parseMIDI(uint8_t* buf, uint32_t n)
     {
         uint8_t* p = buf;
-        while (n >= 3) {
+        while (n > 0) {
+            // System real-time messages (0xF8-0xFF) are single-byte
+            if (*p >= 0xF8) {
+                if (*p == 0xF8) midiClockTick = true;   // MIDI clock
+                ++p; --n;
+                continue;
+            }
+            if (n < 3) break;
             MIDIMsg m(p);
             handleMIDI(m);
             p += 3; n -= 3;
@@ -952,12 +960,20 @@ public:
             arpIdx %= arpCount;
         }
 
-        // Clock: external rising edge on Pulse In 2 if connected, else delay-synced
+        // Clock priority: Pulse In 2 > MIDI clock > internal timer
         bool arpTick = false;
         if (Connected(Input::Pulse2)) {
-            arpTick    = PulseIn2RisingEdge();
+            arpTick     = PulseIn2RisingEdge();
             arpIntTimer = 0;
-        } else {
+        } else if (midiClockTick) {
+            midiClockTick = false;
+            hasMidiClock  = true;
+            if (++midiClockCount >= MIDI_CLOCK_DIV) {
+                midiClockCount = 0;
+                arpTick = true;
+            }
+            arpIntTimer = 0;
+        } else if (!hasMidiClock) {
             int period = 2400 + ((int32_t)KnobVal(Knob::Y) * 33600) / 4096;
             if (++arpIntTimer >= period) { arpIntTimer = 0; arpTick = true; }
         }
@@ -1050,7 +1066,11 @@ private:
     int  arpIdx;        // current note index (-1 = reset)
     int  arpGateTimer;  // samples until Gate Out 2 goes low
     int  arpIntTimer;   // internal delay-synced tick counter
-    static constexpr int ARP_GATE_LEN = 2400;  // 50 ms gate pulse
+    volatile bool midiClockTick;  // set by MIDI core on 0xF8
+    bool hasMidiClock;            // true once first MIDI clock received (disables internal timer)
+    uint8_t midiClockCount;       // counts 0xF8 ticks, fires arp step every MIDI_CLOCK_DIV
+    static constexpr int ARP_GATE_LEN    = 2400;  // 50 ms gate pulse
+    static constexpr int MIDI_CLOCK_DIV  = 6;     // 24 ppqn / 6 = 16th notes
 
     // Config
     uint8_t          midiChannel;     // 0 = omni, 1-16 = specific channel
