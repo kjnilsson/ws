@@ -199,12 +199,13 @@ struct Voice {
     volatile VoiceState  state;
     volatile uint32_t    age;          // voice-stealing: larger = older
     volatile uint32_t    lfoPhase;     // per-voice vibrato LFO phase
+    volatile uint32_t    gen;          // bumped by core 0 on every voice init
 
     Voice()
         : active(false), note(0), phase(0), step(256u),
           envAccum(0), attackRate(1u), decayRate(1u),
           sustainAccum(0), releaseShift(8u),
-          state(VS_IDLE), age(0), lfoPhase(0) {}
+          state(VS_IDLE), age(0), lfoPhase(0), gen(0) {}
 };
 
 static Voice   voices[MAX_VOICES];
@@ -250,7 +251,7 @@ public:
             arpIdx(-1), arpGateTimer(0), arpIntTimer(0),
             midiClockTick(false), hasMidiClock(false), midiClockCount(0),
             midiChannel(0), inConfigMode(false), configMidiChan(0), configVibRate(64),
-            tunerActive(false), tunerDebounce(0), tunerCounter(0)
+            tunerCounter(0)
     {
     }
 
@@ -652,6 +653,7 @@ public:
             // envAccum kept as-is — attack resumes from current level
             voices[slot].lfoPhase     = 0;
             voices[slot].age          = ++voiceAgeCtr;
+            voices[slot].gen++;
             __dmb();
             voices[slot].state        = VS_ATTACK;
             goto voiceReady;
@@ -679,6 +681,7 @@ public:
             voices[slot].envAccum     = 0;
             voices[slot].lfoPhase     = 0;
             voices[slot].age          = ++voiceAgeCtr;
+            voices[slot].gen++;
             __dmb();
             voices[slot].state        = VS_ATTACK;
             voices[slot].active       = true;
@@ -757,10 +760,10 @@ public:
 
     // ---- Audio core (core 0) ----------------------------------------
 
-    virtual void ProcessSample() override
+    virtual void __attribute__((section(".time_critical.ProcessSample"))) ProcessSample() override
     {
-        // Tuner mode disabled (normalisation probe removed).
-        bool tunerMode = false;
+        bool tunerMode = Connected(Input::Audio2);
+        if (tunerMode) tunerPd.addSample(AudioIn1());
 
         // --- Recording (Z switch Down = momentary press) ---
         Switch sw = SwitchVal();
@@ -831,9 +834,10 @@ public:
         // --- Voice processing ---
         int len = sampleLen;
         int32_t mix = 0;
+        bool cvNoteAlive = false;
 
         if (len > 0) {
-            int loopStart = loopStartPt > 0 ? loopStartPt : (len * 2) / 3;
+            int loopStart = loopStartPt > 0 ? loopStartPt : (int)(((uint32_t)len * 43691u) >> 16);
             int loopLen   = len - loopStart;
 
             // Runtime crossfade: is the loop long enough to support it?
@@ -850,36 +854,45 @@ public:
             for (int i = 0; i < MAX_VOICES; i++) {
                 if (!voices[i].active) continue;
 
+                // Snapshot volatile fields into registers
+                uint32_t vGen       = voices[i].gen;
+                uint32_t vPhase     = voices[i].phase;
+                uint32_t vStep      = voices[i].step;
+                uint32_t vEnv       = voices[i].envAccum;
+                VoiceState vState   = voices[i].state;
+                uint32_t vLfoPhase  = voices[i].lfoPhase;
+                uint8_t  vNote      = voices[i].note;
+
                 // Per-voice vibrato LFO (triangle wave, ±0.5 semitones at full mod)
-                uint32_t s = (voices[i].step * bendMult) >> 16;
+                uint32_t s = (vStep * bendMult) >> 16;
                 if (mw > 0) {
-                    voices[i].lfoPhase += li;
-                    uint32_t tri = (voices[i].lfoPhase < 0x80000000u)
-                        ? (voices[i].lfoPhase >> 15)
-                        : ((0xFFFFFFFFu - voices[i].lfoPhase) >> 15);
+                    vLfoPhase += li;
+                    uint32_t tri = (vLfoPhase < 0x80000000u)
+                        ? (vLfoPhase >> 15)
+                        : ((0xFFFFFFFFu - vLfoPhase) >> 15);
                     int32_t lfo = (int32_t)tri - 32768;
                     int32_t vibOffset = ((lfo >> 8) * (int32_t)mw * 15) >> 7;
                     s = (s * (uint32_t)((int32_t)65536 + vibOffset)) >> 16;
                 }
-                voices[i].phase += s;
-                int pos = (int)(voices[i].phase >> 8);
+                vPhase += s;
+                int pos = (int)(vPhase >> 8);
 
                 // Loop wrap: land at wrapTarget so we're past the faded-in head
                 if (pos >= len) {
                     int over = pos - len;
-                    pos = (wrapLoopLen > 0) ? wrapTarget + (over % wrapLoopLen) : wrapTarget;
-                    voices[i].phase = (uint32_t)pos << 8;
+                    if (wrapLoopLen > 0) {
+                        pos = wrapTarget + (over % wrapLoopLen);
+                    } else {
+                        pos = wrapTarget;
+                    }
+                    vPhase = (uint32_t)pos << 8;
                 }
 
                 // 8-bit unsigned → 12-bit signed sample, with runtime loop crossfade.
-                // When pos is in [xfZoneStart, len): simultaneously read from pos (tail,
-                // fading out) and loopStart+xOff (head, fading in).  After the wrap we
-                // resume at loopStart+XFADE_LEN, adjacent to the last faded-in sample,
-                // so there is no discontinuity.
                 int16_t smp;
                 if (canXfade && pos >= xfZoneStart) {
                     int xOff = pos - xfZoneStart;           // 0 .. XFADE_LEN-1
-                    int t    = (xOff << 8) >> 12;          // 0..255 linear  (= xOff*256/4096)
+                    int t    = xOff >> 4;                   // 0..255 linear
                     // Smoothstep: 3t² - 2t³  (avoids the level dip of a linear crossfade)
                     int t2   = (t * t) >> 8;                // t² normalised to 0..255
                     int t3   = (t2 * t) >> 8;               // t³ normalised to 0..255
@@ -892,41 +905,42 @@ public:
                 }
 
                 // ADSR envelope update
-                switch (voices[i].state) {
+                switch (vState) {
                 case VS_ATTACK:
-                    voices[i].envAccum += voices[i].attackRate;
-                    if (voices[i].envAccum >= ENV_TOP) {
-                        voices[i].envAccum = ENV_TOP;
-                        voices[i].state    = VS_DECAY;
+                    vEnv += voices[i].attackRate;
+                    if (vEnv >= ENV_TOP) {
+                        vEnv   = ENV_TOP;
+                        vState = VS_DECAY;
                     }
                     break;
 
-                case VS_DECAY:
-                    if (voices[i].envAccum > voices[i].sustainAccum &&
-                        voices[i].envAccum - voices[i].sustainAccum > voices[i].decayRate)
-                    {
-                        voices[i].envAccum -= voices[i].decayRate;
+                case VS_DECAY: {
+                    uint32_t vSus  = voices[i].sustainAccum;
+                    uint32_t vDec  = voices[i].decayRate;
+                    if (vEnv > vSus && vEnv - vSus > vDec) {
+                        vEnv -= vDec;
                     } else {
-                        voices[i].envAccum = voices[i].sustainAccum;
-                        voices[i].state    = VS_SUSTAIN;
+                        vEnv   = vSus;
+                        vState = VS_SUSTAIN;
                     }
                     break;
+                }
 
                 case VS_SUSTAIN:
-                    voices[i].envAccum = voices[i].sustainAccum;
+                    vEnv = voices[i].sustainAccum;
                     break;
 
                 case VS_RELEASE: {
                     // Kill voice once envelope is inaudible (level < 2 in 16-bit range)
-                    if (voices[i].envAccum < 512u) {
-                        voices[i].envAccum = 0;
-                        voices[i].active   = false;
-                        voices[i].state    = VS_IDLE;
+                    if (vEnv < 512u) {
+                        vEnv = 0;
+                        voices[i].active = false;
+                        vState = VS_IDLE;
                         break;
                     }
-                    uint32_t drop = voices[i].envAccum >> voices[i].releaseShift;
+                    uint32_t drop = vEnv >> voices[i].releaseShift;
                     if (drop == 0) drop = 1;
-                    voices[i].envAccum -= drop;
+                    vEnv -= drop;
                     break;
                 }
 
@@ -934,10 +948,22 @@ public:
                     break;
                 }
 
+                // Write back only if core 0 hasn't re-initialised this voice.
+                // gen mismatch means core 0 did a steal/retrigger mid-iteration.
+                if (voices[i].gen == vGen) {
+                    voices[i].phase    = vPhase;
+                    voices[i].lfoPhase = vLfoPhase;
+                    voices[i].envAccum = vEnv;
+                    voices[i].state    = vState;
+                }
+
                 // Apply envelope:  level = envAccum >> 8  (0-65535)
                 // Output = (12-bit sample × 16-bit level) >> 16  = 12-bit
-                uint32_t level = voices[i].envAccum >> 8;
+                uint32_t level = vEnv >> 8;
                 mix += ((int32_t)smp * (int32_t)level) >> 16;
+
+                if (gateState && vNote == cvGateNote && vState != VS_RELEASE)
+                    cvNoteAlive = true;
             }
 
             mix >>= 3;
@@ -965,12 +991,7 @@ public:
             }
             pendingCVNoteOn = false;
         } else if (gateState) {
-            bool noteStillPlaying = false;
-            for (int i = 0; i < MAX_VOICES; i++)
-                if (voices[i].active && voices[i].note == cvGateNote
-                    && voices[i].state != VS_RELEASE)
-                    { noteStillPlaying = true; break; }
-            if (!noteStillPlaying) { PulseOut1(false); gateState = false; }
+            if (!cvNoteAlive) { PulseOut1(false); gateState = false; }
         }
 
         // Audio Out 2: delay wet only (unchanged by tuner mode).
@@ -981,24 +1002,19 @@ public:
         AudioOut2(delay.process((int16_t)mix, delayKnobY));
 
         // --- Arpeggiator (CV Out 2 / Gate Out 2) ---
-        // Collect held notes (active, non-releasing) into a sorted list
-        uint8_t arpNotes[MAX_VOICES];
-        int     arpCount = 0;
+        // Count held notes (active, non-releasing); defer sorting to tick time
+        int arpCount = 0;
         for (int i = 0; i < MAX_VOICES; i++) {
-            if (!voices[i].active ||
-                voices[i].state == VS_RELEASE ||
-                voices[i].state == VS_IDLE) continue;
-            uint8_t n = voices[i].note;
-            int j = arpCount;
-            while (j > 0 && arpNotes[j-1] > n) { arpNotes[j] = arpNotes[j-1]; --j; }
-            arpNotes[j] = n;
-            ++arpCount;
+            if (voices[i].active &&
+                voices[i].state != VS_RELEASE &&
+                voices[i].state != VS_IDLE)
+                arpCount++;
         }
 
         if (arpCount == 0) {
             arpIdx = -1;
         } else if (arpIdx >= arpCount) {
-            arpIdx %= arpCount;
+            arpIdx = 0;
         }
 
         // Clock priority: Pulse In 2 > MIDI clock > internal timer
@@ -1015,12 +1031,26 @@ public:
             }
             arpIntTimer = 0;
         } else if (!hasMidiClock) {
-            int period = 2400 + ((int32_t)KnobVal(Knob::Y) * 33600) / 4096;
+            int period = 2400 + (int)(((uint32_t)KnobVal(Knob::Y) * 33600u) >> 12);
             if (++arpIntTimer >= period) { arpIntTimer = 0; arpTick = true; }
         }
 
         if (arpTick && arpCount > 0) {
-            arpIdx = (arpIdx + 1) % arpCount;
+            // Build sorted note list only on tick
+            uint8_t arpNotes[MAX_VOICES];
+            int ac = 0;
+            for (int i = 0; i < MAX_VOICES; i++) {
+                if (!voices[i].active ||
+                    voices[i].state == VS_RELEASE ||
+                    voices[i].state == VS_IDLE) continue;
+                uint8_t n = voices[i].note;
+                int j = ac;
+                while (j > 0 && arpNotes[j-1] > n) { arpNotes[j] = arpNotes[j-1]; --j; }
+                arpNotes[j] = n;
+                ++ac;
+            }
+            arpIdx = arpIdx + 1;
+            if (arpIdx >= ac) arpIdx = 0;
             // 50 % chance of octave-down shift (skipped for notes below C1)
             static uint32_t arpRand = 0xdeadbeef;
             arpRand ^= arpRand << 13;
@@ -1035,44 +1065,40 @@ public:
         if (arpGateTimer > 0 && --arpGateTimer == 0) PulseOut2(false);
         if (arpCount == 0)                           PulseOut2(false);
 
-        // --- LEDs ---
-        // All 6 LEDs = voice activity.  During recording all voices are silenced
-        // so we light all LEDs to show recording is in progress.
+        // --- LEDs (throttled to every 64th sample = 750 Hz) ---
         static uint32_t sampleCount = 0;
         ++sampleCount;
 
-        if (inConfigMode) {
-            // LEDs 0-4: MIDI channel in binary (0 = omni = all off, 1-16 = channel)
-            // LED 5: slow blink to indicate config mode
-            uint8_t ch = configMidiChan;
-            for (int i = 0; i < 5; i++) LedOn(i, (ch >> i) & 1u);
-            LedOn(5, (sampleCount >> 15) & 1u);
-        } else if (recording) {
-            for (int i = 0; i < 6; i++) LedOn(i, true);
-        } else {
-            for (int i = 0; i < MAX_VOICES; i++) {
-                if (tunerMode && (i == 0 || i == 2 || i == 4)) continue;
-                if (i == 5 && presetFlashTimer > 0) {
-                    LedOn(5, true);
-                    --presetFlashTimer;
-                } else if (i == bankIdx && !voices[i].active) {
-                    // Selected bank LED: dim when idle, blink while save pending
-                    if (flashPending)
-                        LedOn(i, (sampleCount >> 12) & 1u);
-                    else
-                        LedBrightness(i, 2048);
-                } else {
-                    LedBrightness(i, voices[i].active ? (uint16_t)(voices[i].envAccum >> 12) : 0);
+        if ((sampleCount & 63u) == 0) {
+            if (inConfigMode) {
+                uint8_t ch = configMidiChan;
+                for (int i = 0; i < 5; i++) LedOn(i, (ch >> i) & 1u);
+                LedOn(5, (sampleCount >> 15) & 1u);
+            } else if (recording) {
+                for (int i = 0; i < 6; i++) LedOn(i, true);
+            } else {
+                for (int i = 0; i < MAX_VOICES; i++) {
+                    if (tunerMode && (i == 0 || i == 2 || i == 4)) continue;
+                    if (i == 5 && presetFlashTimer > 0) {
+                        LedOn(5, true);
+                    } else if (i == bankIdx && !voices[i].active) {
+                        if (flashPending)
+                            LedOn(i, (sampleCount >> 12) & 1u);
+                        else
+                            LedBrightness(i, 1024);
+                    } else {
+                        LedBrightness(i, voices[i].active ? (uint16_t)(voices[i].envAccum >> 12) : 0);
+                    }
                 }
+                if (tunerMode && !tunerCounter) {
+                    TunerLedValues v = tunerLedValues(periodToCloseness(tunerPd.period()));
+                    LedBrightness(4, v.flat);
+                    LedBrightness(2, v.center);
+                    LedBrightness(0, v.sharp);
+                }
+                tunerCounter++;
             }
-            if (tunerMode && !tunerCounter) {
-                // LEDs 0/2/4: tuner display (flat=4, center=2, sharp=0)
-                TunerLedValues v = tunerLedValues(periodToCloseness(tunerPd.period()));
-                LedBrightness(4, v.flat);
-                LedBrightness(2, v.center);
-                LedBrightness(0, v.sharp);
-            }
-            tunerCounter++;
+            if (presetFlashTimer > 0) presetFlashTimer -= 64;
         }
     }
 
@@ -1120,10 +1146,6 @@ private:
     volatile uint8_t configVibRate;   // vibrato rate being dialled in during config mode
 
     // Tuner (active when Audio In 2 is connected)
-    bool          tunerActive;        // debounced tuner mode state
-    int           tunerDebounce;      // leaky integrator for tuner detection
-    static constexpr int TUNER_DEBOUNCE_HIGH = 24000;  // 0.5 s to enter tuner mode
-    static constexpr int TUNER_DEBOUNCE_LOW  = 2400;   // 50 ms to exit tuner mode
     PitchDetector tunerPd;
     uint8_t       tunerCounter;      // wraps every 256 samples for display update
 
@@ -1173,9 +1195,7 @@ int main()
     initBendTable();
     VSS vss;
     VSS::s_instance = &vss;   // audioEntry() needs this before Run() sets thisptr
-    // Normalisation probe disabled — it causes 512-sample glitches on Audio Out 1
-    // when Audio In 1 is connected (probe falsely detects Audio In 2 as connected,
-    // momentarily enabling tuner mode passthrough).
+    vss.EnableNormalisationProbe();
     // Audio on core 1 (lockout victim); USB + flash save on core 0 (main thread).
     // This matches the reverb card architecture: flash ops happen from the non-ISR
     // core so multicore_lockout_start_blocking() is safe to call.

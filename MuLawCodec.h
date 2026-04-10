@@ -31,12 +31,12 @@ public:
     }
 
     // Encode a 12-bit signed sample to 8-bit µ-law
-    inline uint8_t encodeSample(int16_t input) {
+    inline __attribute__((always_inline)) uint8_t encodeSample(int16_t input) {
         return encodeTable[(uint16_t)(input + 2048) & 0xFFF];
     }
 
     // Decode 8-bit µ-law back to 12-bit signed
-    inline int16_t decodeSample(uint8_t mulaw) {
+    inline __attribute__((always_inline)) int16_t decodeSample(uint8_t mulaw) {
         return decodeTable[mulaw];
     }
 

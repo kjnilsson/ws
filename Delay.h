@@ -42,10 +42,10 @@ public:
 
     // input: 12-bit signed; returns 12-bit signed wet output.
     // knobY: 0-4095
-    int16_t process(int16_t input, int knobY)
+    int16_t __attribute__((section(".time_critical.DelayProcess"))) process(int16_t input, int knobY)
     {
         // Target delay in Q8
-        int32_t targetQ8 = (2400 + ((int32_t)knobY * 33600) / 4096) << 8;
+        int32_t targetQ8 = (2400 + (((int32_t)knobY * 33600) >> 12)) << 8;
 
         // Slew currentDelay toward target
         int32_t diff = targetQ8 - currentDelayQ8;
